@@ -4674,7 +4674,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				shouldRemove := true
 				if sa := mset.streamAssignment(); sa != nil && sa.Group != nil {
 					js.mu.RLock()
-					shouldRemove = !sa.Group.isMember(ourID)
+					shouldRemove = !sa.Group.isMemberOrDesired(ourID)
 					js.mu.RUnlock()
 				}
 				if shouldRemove {
@@ -7095,13 +7095,12 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 			}
 			js.mu.RUnlock()
 			if peer := string(e.Data); peer == ourID {
+				// Double check here with the registered consumer assignment.
 				shouldRemove := true
-				if mset := o.getStream(); mset != nil {
-					if sa := mset.streamAssignment(); sa != nil && sa.Group != nil {
-						js.mu.RLock()
-						shouldRemove = !sa.Group.isMember(ourID)
-						js.mu.RUnlock()
-					}
+				if ca := o.consumerAssignment(); ca != nil && ca.Group != nil {
+					js.mu.RLock()
+					shouldRemove = !ca.Group.isMemberOrDesired(ourID)
+					js.mu.RUnlock()
 				}
 				if shouldRemove {
 					o.stopWithFlags(true, false, false, false)
