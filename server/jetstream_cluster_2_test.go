@@ -5813,6 +5813,86 @@ func TestJetStreamClusterNewHealthz(t *testing.T) {
 	c.waitOnServerHealthz(sl)
 }
 
+func TestJetStreamClusterHealthzReportsDesiredMember(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// R1 stream lives on exactly one server, leaving two non-members.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+
+	// Pick a server that is not a member of the stream's group.
+	var nonMember *Server
+	for _, s := range c.servers {
+		sjs := s.getJetStream()
+		sjs.mu.RLock()
+		sa := sjs.streamAssignment(globalAccountName, "TEST")
+		member := sa != nil && sa.Group.isCurrentMember(s.Node())
+		sjs.mu.RUnlock()
+		if !member {
+			nonMember = s
+			break
+		}
+	}
+	require_NotNil(t, nonMember)
+
+	// Baseline: the non-member doesn't run TEST, so healthz must not report it.
+	hs := nonMember.healthz(nil)
+	require_Equal(t, hs.StatusCode, 200)
+
+	// Inject a desired placement naming the non-member.
+	sjs := nonMember.getJetStream()
+	sjs.mu.Lock()
+	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	if sa == nil {
+		sjs.mu.Unlock()
+		t.Fatal("stream assignment not found for TEST")
+	}
+	id := nonMember.Node()
+	sa.Group.Desired = &desiredGroupPlacement{
+		ID: "desired-test",
+		Group: &raftGroup{
+			Name:    sa.Group.Name,
+			Peers:   []string{id},
+			Storage: sa.Group.Storage,
+		},
+	}
+	// Desired-aware membership is now true while committed membership is not.
+	isMember := sa.Group.isMember(id)
+	isCurrentMember := sa.Group.isCurrentMember(id)
+	sjs.mu.Unlock()
+	require_True(t, isMember)
+	require_False(t, isCurrentMember)
+
+	// healthz must now select TEST and report it as not current, since the
+	// asset isn't actually running on this server.
+	hs = nonMember.healthz(&HealthzOptions{Details: true})
+	require_Equal(t, hs.Status, "error")
+	var found bool
+	for _, he := range hs.Errors {
+		if he.Stream == "TEST" {
+			found = true
+			require_Equal(t, he.Type, HealthzErrorStream)
+			require_Equal(t, he.Error, "JetStream stream '$G > TEST' is not current: stream not found")
+		}
+	}
+	require_True(t, found)
+
+	// Clearing the desired placement returns healthz to not reporting TEST.
+	sjs.mu.Lock()
+	sa.Group.Desired = nil
+	sjs.mu.Unlock()
+	hs = nonMember.healthz(nil)
+	require_Equal(t, hs.StatusCode, 200)
+}
+
 func TestJetStreamClusterConsumerOverrides(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
 	defer c.shutdown()
