@@ -109,7 +109,8 @@ type leaf struct {
 	// "_LR_" leaf reply (interest compaction). lrEnabled is set during connection
 	// setup when both ends support it. lrEligible holds the subject patterns whose
 	// subscriptions are collapsed into this server's reply wildcard over this
-	// connection (always includes "_INBOX.>", extended per remote config).
+	// connection (defaults to "_INBOX.>" when none are configured; otherwise the
+	// exact per-remote CompactInterest patterns).
 	lrEnabled  bool
 	lrEligible *Sublist
 }
@@ -2825,20 +2826,22 @@ func isLeafReplySubject(subj []byte) bool {
 
 // buildLeafReplyEligible compiles the subject patterns whose subscriptions are
 // eligible for "_LR_" reply collapse over this leaf connection into an efficient
-// sublist matcher. "_INBOX.>" is always eligible; per-remote CompactInterest
-// patterns extend it. No-op if "_LR_" is not active on the connection.
+// sublist matcher. When no patterns are configured for the remote it defaults to
+// "_INBOX.>"; when patterns are configured they are used exactly as given (the
+// "_INBOX.>" default is not implicitly included). No-op if "_LR_" is not active.
 // Lock should be held (modifies c.leaf).
 func (c *client) buildLeafReplyEligible() {
 	if c.leaf == nil || !c.leaf.lrEnabled {
 		return
 	}
+	patterns := []string{leafInboxWildcard}
+	if r := c.leaf.remote; r != nil && len(r.CompactInterest) > 0 {
+		patterns = r.CompactInterest
+	}
 	sl := NewSublistNoCache()
-	sl.Insert(&subscription{subject: []byte(leafInboxWildcard)})
-	if r := c.leaf.remote; r != nil {
-		for _, p := range r.CompactInterest {
-			if p != _EMPTY_ {
-				sl.Insert(&subscription{subject: []byte(p)})
-			}
+	for _, p := range patterns {
+		if p != _EMPTY_ {
+			sl.Insert(&subscription{subject: []byte(p)})
 		}
 	}
 	c.leaf.lrEligible = sl

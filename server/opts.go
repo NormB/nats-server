@@ -330,11 +330,12 @@ type RemoteLeafOpts struct {
 
 	// CompactInterest is the set of subject patterns whose subscriptions are
 	// eligible to be collapsed into this server's single "_LR_" reply route
-	// over this leaf connection, trimming propagated interest. "_INBOX.>" is
-	// always eligible when both ends support "_LR_"; entries here extend that
-	// set (e.g. additional deliver/request-reply prefixes, or ">" to collapse
-	// all subscriptions). Only applies if the connected remote also supports
-	// "_LR_".
+	// over this leaf connection, trimming propagated interest. If left unset it
+	// defaults to ["_INBOX.>"]. If set, the listed patterns are used exactly as
+	// given and "_INBOX.>" is NOT implicitly included, so it must be listed
+	// explicitly if still desired (e.g. ["_INBOX.>", "deliver.>"], or [">"] to
+	// collapse all subscriptions). Only applies if the connected remote also
+	// supports "_LR_".
 	CompactInterest []string `json:"-"`
 }
 

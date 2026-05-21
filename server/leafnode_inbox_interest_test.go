@@ -307,10 +307,10 @@ func checkSubInterestServer(t *testing.T, s *Server, subj string) {
 	})
 }
 
-// Per-remote configuration extends the eligible set beyond the default
-// "_INBOX.>". Here the spoke also collapses "deliver.>". Subscriptions matching
-// either pattern collapse into the single reply wildcard; a non-eligible
-// subject still propagates as its own interest entry.
+// When compact_interest is configured, the patterns are used exactly as given:
+// "_INBOX.>" is NOT implicitly included. Here only "deliver.>" is eligible, so
+// deliver subs collapse to one reply wildcard while inbox (and other) subs keep
+// propagating as their own interest entries.
 func TestLeafNodeInboxInterestLRCustomPatterns(t *testing.T) {
 	hub, spoke := runInboxInterestLeafPair(t, true, "deliver.>")
 	defer hub.Shutdown()
@@ -319,28 +319,35 @@ func TestLeafNodeInboxInterestLRCustomPatterns(t *testing.T) {
 	ncSpoke := natsConnect(t, spoke.ClientURL())
 	defer ncSpoke.Close()
 
-	// 5 inbox subs + 5 deliver subs (both eligible) -> collapse to 1 remote.
+	// 5 inbox subs (NOT eligible now) + 5 deliver subs (eligible -> collapse).
+	inboxes := make([]string, 5)
 	for i := 0; i < 5; i++ {
-		natsSubSync(t, ncSpoke, nats.NewInbox())
+		inboxes[i] = nats.NewInbox()
+		natsSubSync(t, ncSpoke, inboxes[i])
 		natsSubSync(t, ncSpoke, fmt.Sprintf("deliver.%d", i))
 	}
-	// One non-eligible subject -> must still propagate as its own interest.
+	// One more non-eligible subject.
 	natsSubSync(t, ncSpoke, "other.subject")
 	natsFlush(t, ncSpoke)
 
-	// On the hub: 1 collapsed "_LR_" wildcard + 1 normal "other.subject" sub.
+	// On the hub: 5 inbox + 1 "other.subject" propagate individually, and the 5
+	// deliver subs collapse into a single "_LR_" wildcard => 7 remote, 1 _LR_.
 	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
 		_, remote, _, lr := inboxSubBreakdown(hub)
-		if remote != 2 || lr != 1 {
-			return fmt.Errorf("hub: want 2 remote (1 _LR_ + 1 plain), got %d remote (%d _LR_)", remote, lr)
+		if remote != 7 || lr != 1 {
+			return fmt.Errorf("hub: want 7 remote (5 inbox + 1 plain + 1 _LR_), got %d remote (%d _LR_)", remote, lr)
 		}
 		return nil
 	})
+	// Inbox subs are NOT collapsed: each propagates individually.
+	if !hub.globalAccount().SubscriptionInterest(inboxes[0]) {
+		t.Fatalf("hub should carry inbox %q individually (not collapsed)", inboxes[0])
+	}
 	if !hub.globalAccount().SubscriptionInterest("other.subject") {
 		t.Fatalf("hub should still carry the non-eligible 'other.subject' interest")
 	}
 	if !hub.globalAccount().SubscriptionInterest(spoke.lrReplyWildcard) {
-		t.Fatalf("hub should carry the spoke reply wildcard %q", spoke.lrReplyWildcard)
+		t.Fatalf("hub should carry the spoke reply wildcard %q for collapsed deliver subs", spoke.lrReplyWildcard)
 	}
 
 	// Correctness: a request whose reply is a custom-eligible subject (deliver.*)
