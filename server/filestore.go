@@ -373,6 +373,10 @@ const (
 	rlBadThresh = 32 * 1024 * 1024
 	// Checksum size for hash for msg records.
 	recordHashSize = 8
+
+	// Above this number of subjects, index.db may not be written regularly anymore, and
+	// certain psim optimisations may not be used.
+	highCardinalityThreshold = 1_000_000
 )
 
 func newFileStore(fcfg FileStoreConfig, cfg StreamConfig) (*fileStore, error) {
@@ -3272,6 +3276,9 @@ func (fs *fileStore) checkSkipFirstBlock(filter string, wc bool, bi int) (int, e
 	// Move through psim to gather start and stop bounds.
 	start, stop := uint32(math.MaxUint32), uint32(0)
 	if wc {
+		if fs.psim.Size() > highCardinalityThreshold {
+			return bi + 1, nil
+		}
 		fs.psim.Match(stringToBytes(filter), func(_ []byte, psi *psi) {
 			if psi.fblk < start {
 				start = psi.fblk
@@ -3294,7 +3301,7 @@ func (fs *fileStore) checkSkipFirstBlock(filter string, wc bool, bi int) (int, e
 // Will return -1 and ErrStoreEOF if no matches at all or no more from where we are.
 func (fs *fileStore) checkSkipFirstBlockMulti(sl *gsl.SimpleSublist, bi int) (int, error) {
 	// Don't bother if full wildcard.
-	if sl.MatchesFullWildcard() {
+	if sl.MatchesFullWildcard() || fs.psim.Size() > highCardinalityThreshold {
 		return bi + 1, nil
 	}
 	// Move through psim to gather start and stop bounds.
@@ -6965,6 +6972,11 @@ func (fs *fileStore) writeTombstoneNoFlush(seq uint64, ts int64) error {
 
 // Lock should be held.
 func (mb *msgBlock) recompressOnDiskIfNeeded() error {
+	// If the block has been closed in the meantime, skip.
+	if mb.closed {
+		return nil
+	}
+
 	alg := mb.fs.fcfg.Compression
 
 	// Open up the file block and read in the entire contents into memory.
@@ -9121,6 +9133,10 @@ func compareFn(subject string) func(string, string) bool {
 // PurgeEx will remove messages based on subject filters, sequence and number of messages to keep.
 // Will return the number of purged messages.
 func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint64, err error) {
+	// sequence == 1 means "purge up to but not including 1", a no-op.
+	if sequence == 1 {
+		return 0, nil
+	}
 	if subject == _EMPTY_ || subject == fwcs {
 		if keep == 0 && sequence == 0 {
 			return fs.purge(0)
@@ -9128,11 +9144,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		if sequence > 1 {
 			return fs.compact(sequence)
 		}
-	}
-
-	// Make sure to not leave subject if empty and we reach this spot.
-	if subject == _EMPTY_ {
-		subject = fwcs
+		// Make sure to not leave subject if empty.
+		if subject == _EMPTY_ {
+			subject = fwcs
+		}
 	}
 
 	eq, wc := compareFn(subject), subjectHasWildcard(subject)
@@ -9209,7 +9224,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 			continue
 		}
 
-		if sequence > 1 && sequence <= l {
+		// "Purge up to but not including sequence": sequence == 0 means no
+		// sequence filter; sequence >= 1 clamps the per-block upper bound to
+		// sequence-1 (so sequence == 1 leaves nothing to process).
+		if sequence >= 1 && sequence <= l {
 			l = sequence - 1
 		}
 
@@ -9369,7 +9387,11 @@ func (fs *fileStore) purge(fseq uint64) (uint64, error) {
 	fs.state.Msgs = 0
 
 	for _, mb := range fs.blks {
-		mb.dirtyClose()
+		// These blocks are being discarded by the purge, so mark them closed.
+		mb.mu.Lock()
+		mb.dirtyCloseWithRemove(false)
+		mb.closed = true
+		mb.mu.Unlock()
 	}
 
 	fs.blks = nil
@@ -10148,6 +10170,8 @@ func (mb *msgBlock) dirtyCloseWithRemove(remove bool) error {
 		mb.mfd = nil
 	}
 	if remove {
+		// The block is being destroyed, so mark it closed.
+		mb.closed = true
 		// Clear any tracking by subject if we are removing.
 		mb.fss = nil
 		if mb.mfn != _EMPTY_ {
@@ -10704,13 +10728,12 @@ func (fs *fileStore) _writeFullState(force, needLock bool) error {
 	// We will base off of number of subjects and interior deletes. A very large number of msg blocks could also
 	// be used, but for next server version will redo all meta handling to be disk based. So this is temporary.
 	if !force {
-		const numThreshold = 1_000_000
 		// Calculate interior deletes.
 		var numDeleted int
 		if fs.state.LastSeq > fs.state.FirstSeq {
 			numDeleted = int((fs.state.LastSeq - fs.state.FirstSeq + 1) - fs.state.Msgs)
 		}
-		if numSubjects > numThreshold || numDeleted > numThreshold {
+		if numSubjects > highCardinalityThreshold || numDeleted > highCardinalityThreshold {
 			fsUnlock()
 			return errStateTooBig
 		}
