@@ -8705,24 +8705,20 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		return
 	}
 
+	// Check if this stream is already being scaled/moved.
+	if osa.Group != nil && osa.Group.Desired != nil {
+		resp.Error = NewJSStreamMoveInProgressError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
+	}
+
 	// Make copy so to not change original.
 	rg := osa.copyGroup().Group
 
 	// Check for a move request.
-	var isMoveRequest, isMoveCancel bool
+	var isMoveRequest bool
 	if lPeerSet := len(peerSet); lPeerSet > 0 {
 		isMoveRequest = true
-		// check if this is a cancellation
-		if lPeerSet == osa.Config.Replicas && lPeerSet <= len(rg.Peers) {
-			isMoveCancel = true
-			// can only be a cancellation if the peer sets overlap as expected
-			for i := 0; i < lPeerSet; i++ {
-				if peerSet[i] != rg.Peers[i] {
-					isMoveCancel = false
-					break
-				}
-			}
-		}
 	} else {
 		isMoveRequest = newCfg.Placement != nil && !reflect.DeepEqual(osa.Config.Placement, newCfg.Placement)
 	}
@@ -8732,16 +8728,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// We stage consumer updates and do them after the stream update.
 	var consumers []*consumerAssignment
-
-	// Check if this is a move request, but no cancellation, and we are already moving this stream.
-	if osa.Group != nil && osa.Group.Desired != nil {
-		resp.Error = NewJSStreamMoveInProgressError()
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-		return
-	}
-
-	// FIXME(mvv): move cancel
-	_ = isMoveCancel
 
 	// Can not move and scale at same time.
 	if isMoveRequest && isReplicaChange {
