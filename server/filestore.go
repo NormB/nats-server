@@ -719,7 +719,7 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 		fs.ageChkTime = 0
 	}
 
-	if fs.cfg.MaxMsgsPer > 0 && (old_cfg.MaxMsgsPer == 0 || fs.cfg.MaxMsgsPer < old_cfg.MaxMsgsPer) {
+	if fs.cfg.MaxMsgsPer > 0 && (old_cfg.MaxMsgsPer <= 0 || fs.cfg.MaxMsgsPer < old_cfg.MaxMsgsPer) {
 		fs.enforceMsgPerSubjectLimit(true)
 	}
 
@@ -4703,15 +4703,17 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 	}
 
 	// Adjust top level tracking of per subject msg counts.
+	var info *psi
+	var ok bool
 	if len(subj) > 0 && fs.psim != nil {
 		index := fs.lmb.index
-		if info, ok := fs.psim.Find(stringToBytes(subj)); ok {
+		if info, ok = fs.psim.Find(stringToBytes(subj)); ok {
 			info.total++
 			if index > info.lblk {
 				info.lblk = index
 			}
 		} else {
-			fs.psim.Insert(stringToBytes(subj), psi{total: 1, fblk: index, lblk: index})
+			info, _ = fs.psim.Insert(stringToBytes(subj), psi{total: 1, fblk: index, lblk: index})
 			fs.tsl += len(subj)
 		}
 	}
@@ -4756,6 +4758,10 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 				fs.rebuildStateLocked(ld)
 			}
 		}
+	}
+	// If we only ever store one/last message for a subject, can correct the first block to where we've just written.
+	if info != nil && info.total == 1 && mmp == 1 {
+		info.fblk = info.lblk
 	}
 
 	// Limits checks and enforcement.
