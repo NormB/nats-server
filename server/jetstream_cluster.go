@@ -3972,8 +3972,16 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	ci := js.clusterInfo(rg)
 	mset.checkClusterInfo(ci)
 
-	// Check if we're working with desired state.
 	js.mu.RLock()
+
+	// We are shutting down.
+	if cc == nil || cc.meta == nil {
+		js.mu.RUnlock()
+		return false
+	}
+	meta := cc.meta
+
+	// Check if we're working with desired state.
 	if sa != nil && sa.Group != nil && sa.Group.Desired != nil {
 		// If a membership change is in progress, we just wait for it to clear.
 		if n.MembershipChangeInProgress() {
@@ -3989,14 +3997,12 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		// e.g. by a server peer-remove. It can't take part in this migration, so
 		// remove it from the group right away rather than waiting for the rest of
 		// the migration to complete.
-		if cc != nil && cc.meta != nil {
-			current, metaPeers := sa.Group.Peers, cc.meta.PeerNames()
-			for _, peer := range actual {
-				if !slices.Contains(current, peer) && !slices.Contains(desired, peer) && !slices.Contains(metaPeers, peer) {
-					js.mu.RUnlock()
-					n.ProposeRemovePeer(peer)
-					return false
-				}
+		current, metaPeers := sa.Group.Peers, meta.PeerNames()
+		for _, peer := range actual {
+			if !slices.Contains(current, peer) && !slices.Contains(desired, peer) && !slices.Contains(metaPeers, peer) {
+				js.mu.RUnlock()
+				n.ProposeRemovePeer(peer)
+				return false
 			}
 		}
 
@@ -4087,8 +4093,6 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	if newPeerSet[ourPeerId] {
 		// First need to check on any consumers and make sure they have moved properly before scaling down ourselves.
 		js.mu.RLock()
-		// Need to read meta under the js lock, it's set to nil on shutdown.
-		meta := cc.meta
 		var needToWait bool
 		for name, c := range sa.consumers {
 			if c.unsupported != nil {
@@ -4108,10 +4112,6 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		}
 		js.mu.RUnlock()
 		if needToWait {
-			return false
-		}
-		if meta == nil {
-			// We are shutting down.
 			return false
 		}
 		// We are good to go, can scale down here.
@@ -4181,8 +4181,16 @@ func (mset *stream) isMigrating() bool {
 func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n RaftNode) bool {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
-	// Check if we're working with desired state.
 	js.mu.RLock()
+
+	// We are shutting down.
+	if cc == nil || cc.meta == nil {
+		js.mu.RUnlock()
+		return false
+	}
+	meta := cc.meta
+
+	// Check if we're working with desired state.
 	if ca != nil && ca.Group != nil && ca.Group.Desired != nil {
 		// If a membership change is in progress, we just wait for it to clear.
 		if n.MembershipChangeInProgress() {
@@ -4198,14 +4206,12 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		// e.g. by a server peer-remove. It can't take part in this migration, so
 		// remove it from the group right away rather than waiting for the rest of
 		// the migration to complete.
-		if cc != nil && cc.meta != nil {
-			current, metaPeers := ca.Group.Peers, cc.meta.PeerNames()
-			for _, peer := range actual {
-				if !slices.Contains(current, peer) && !slices.Contains(desired, peer) && !slices.Contains(metaPeers, peer) {
-					js.mu.RUnlock()
-					n.ProposeRemovePeer(peer)
-					return false
-				}
+		current, metaPeers := ca.Group.Peers, meta.PeerNames()
+		for _, peer := range actual {
+			if !slices.Contains(current, peer) && !slices.Contains(desired, peer) && !slices.Contains(metaPeers, peer) {
+				js.mu.RUnlock()
+				n.ProposeRemovePeer(peer)
+				return false
 			}
 		}
 
@@ -4275,7 +4281,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		cca := ca.copyGroup()
 		cca.Group.Peers = newPeers
 		cca.Group.Cluster = s.cachedClusterName()
-		cc.meta.ForwardProposal(encodeAddConsumerAssignment(cca))
+		meta.ForwardProposal(encodeAddConsumerAssignment(cca))
 		s.Noticef("Scaling down '%s > %s > %s' to %+v", ca.Client.serviceAccount(), ca.Stream, ca.Name, s.peerSetToNames(newPeers))
 
 	} else {
