@@ -14,7 +14,6 @@
 package server
 
 import (
-	"archive/tar"
 	"bytes"
 	"cmp"
 	"encoding/json"
@@ -32,6 +31,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/nats-io/nats-server/v2/server/archive"
 	"github.com/nats-io/nuid"
 )
 
@@ -3939,22 +3939,18 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 		var mset *stream
 		var err error
 
-		// Determine the snapshot format:
-		// - v1: First file in the tar will be meta.inf
-		// - v2: First file in the tar will be state.json
+		// Determine the snapshot format.
 		var consumed bytes.Buffer
-		var hdr *tar.Header
 		tee := io.TeeReader(pr, &consumed)
-		tr := tar.NewReader(s2.NewReader(tee))
-		if hdr, err = tr.Next(); err == nil {
+		sr := s2.NewReader(tee)
+		var preamble [8]byte
+		var n int
+		if n, err = sr.Read(preamble[:]); err == nil && n == len(preamble) {
 			replay := io.MultiReader(&consumed, pr)
-			switch hdr.Name {
-			case "meta.inf":
-				mset, err = acc.RestoreStream(cfg, replay)
-			case "state.json":
+			if bytes.Equal(preamble[:], []byte(archive.MagicBytes)) {
 				mset, err = acc.RestoreStreamV2(cfg, replay)
-			default:
-				err = fmt.Errorf("unknown snapshot version")
+			} else {
+				mset, err = acc.RestoreStream(cfg, replay)
 			}
 		}
 		if err != nil {

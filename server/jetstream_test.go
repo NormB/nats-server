@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats-server/v2/server/archive"
 	"github.com/nats-io/nats-server/v2/server/ats"
 	"github.com/nats-io/nats-server/v2/server/sysmem"
 	"github.com/nats-io/nats.go"
@@ -3144,7 +3145,7 @@ func TestJetStreamCheckBytesLimitsOverflow(t *testing.T) {
 
 	// addBytes + maxBytesOffset overflow.
 	// In the snapshot-restore path, maxBytesOffset (bc) accumulates from
-	// hdr.Size and can be non-zero when addBytes is near MaxInt64.
+	// hdr.HeaderSize + hdr.PayloadSize and can be non-zero when addBytes is near MaxInt64.
 	// Previously this silently wrapped negative, bypassing the limit.
 	js.mu.RLock()
 	err := js.checkBytesLimits(limits, _EMPTY_, math.MaxInt64, 1, FileStorage, false, 0, 1)
@@ -3719,46 +3720,37 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 	// }
 }
 
-func TestJetStreamSnapshotsAPIMessagePreamble(t *testing.T) {
+func TestJetStreamSnapshotsAPIArchiveMessageLayout(t *testing.T) {
+	var buf bytes.Buffer
+	w := archive.NewWriter(&buf)
+
 	hdr := []byte("NATS/1.0\r\nNats-Msg-Id: X\r\n\r\n")
 	msg := []byte("hello world")
 	subj := "foo.bar"
-	preamble := fmt.Sprintf("%d %d %s\r\n", len(hdr), len(subj), subj)
-
 	body := append(hdr, msg...)
-	r := strings.NewReader(preamble + string(body))
-
-	gotSubj, hlen, err := parseSnapshotMessagePreamble(r, MAX_CONTROL_LINE_SIZE)
+	entry := archive.Header{
+		Name:        subj,
+		Timestamp:   12345,
+		Sequence:    99,
+		HeaderSize:  int64(len(hdr)),
+		PayloadSize: int64(len(msg)),
+	}
+	require_NoError(t, w.WriteHeader(&entry))
+	_, err := w.Write(body)
 	require_NoError(t, err)
-	require_Equal(t, gotSubj, subj)
-	require_Equal(t, hlen, len(hdr))
-}
+	require_NoError(t, w.Close())
 
-func TestJetStreamSnapshotsAPIMessagePreambleAllowsEmptySubject(t *testing.T) {
-	hdr := []byte("NATS/1.0\r\n\r\n")
-	msg := []byte("msg")
-	subj := ""
-	preamble := fmt.Sprintf("%d %d %s\r\n", len(hdr), len(subj), subj)
-
-	body := append(hdr, msg...)
-	r := strings.NewReader(preamble + string(body))
-
-	gotSubj, hlen, err := parseSnapshotMessagePreamble(r, MAX_CONTROL_LINE_SIZE)
+	r := archive.NewReader(bytes.NewReader(buf.Bytes()))
+	gotHdr, err := r.Next()
 	require_NoError(t, err)
-	require_Equal(t, gotSubj, subj)
-	require_Equal(t, hlen, len(hdr))
-}
+	require_Equal(t, subj, gotHdr.Name)
+	require_Equal(t, int64(len(hdr)), gotHdr.HeaderSize)
+	require_Equal(t, int64(len(msg)), gotHdr.PayloadSize)
+	require_Equal(t, uint64(99), gotHdr.Sequence)
 
-func TestJetStreamSnapshotsAPIMessagePreambleRejectsMalformedPreamble(t *testing.T) {
-	r := strings.NewReader("10 3 fooX\r\nabc")
-	_, _, err := parseSnapshotMessagePreamble(r, MAX_CONTROL_LINE_SIZE)
-	require_Error(t, err)
-}
-
-func TestJetStreamSnapshotsAPIMessagePreambleRejectsLargeSubject(t *testing.T) {
-	r := strings.NewReader("10 3 foobar\r\n")
-	_, _, err := parseSnapshotMessagePreamble(r, 1)
-	require_Error(t, err)
+	gotBody, err := io.ReadAll(r)
+	require_NoError(t, err)
+	require_True(t, bytes.Equal(body, gotBody))
 }
 
 func TestJetStreamSnapshotsAPIRestoreLimits(t *testing.T) {
