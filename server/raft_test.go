@@ -1327,6 +1327,129 @@ func TestNRGTruncateWALClearsPendingAppendEntryCache(t *testing.T) {
 	require_NotNil(t, n.pae[1])
 }
 
+func TestNRGTruncateWALRevertsUncommittedAddPeer(t *testing.T) {
+	const (
+		KindLeader = iota
+		KindFollower
+		KindRestart
+	)
+	test := func(kind int) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		newPeer := "yrzKKRBu" // "nats-1"
+		n.addPeer(nats0)
+		require_Len(t, len(n.peers), 2)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		addPeer := newEntry(EntryAddPeer, []byte(newPeer))
+
+		if kind == KindLeader {
+			n.switchToLeader()
+			n.sendMembershipChange(addPeer)
+		} else {
+			// Store a normal entry, then an uncommitted AddPeer entry.
+			ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+			ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{addPeer}})
+			aesub := n.aesub
+			if kind == KindRestart {
+				aesub = nil
+			}
+			n.processAppendEntry(ae1, aesub)
+			n.processAppendEntry(ae2, aesub)
+		}
+
+		// The peer is tracked speculatively, and a membership change is now inflight.
+		require_Equal(t, n.pindex, 2)
+		_, ok := n.peers[newPeer]
+		require_True(t, ok)
+		require_Equal(t, n.csz, 3)
+		require_Equal(t, n.qn, 2)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+		require_Equal(t, n.membChange.peer, newPeer)
+		require_True(t, n.membChange.prev == nil)
+
+		// Truncate the uncommitted AddPeer entry. Its speculative effects must be reverted.
+		n.truncateWAL(1, 1)
+		require_Equal(t, n.pindex, 1)
+		_, ok = n.peers[newPeer]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_Equal(t, n.qn, 2)
+		require_True(t, n.membChange == nil)
+	}
+
+	t.Run("Leader", func(t *testing.T) { test(KindLeader) })
+	t.Run("Follower", func(t *testing.T) { test(KindFollower) })
+	t.Run("Restart", func(t *testing.T) { test(KindRestart) })
+}
+
+func TestNRGTruncateWALRevertsUncommittedRemovePeer(t *testing.T) {
+	const (
+		KindLeader = iota
+		KindFollower
+		KindRestart
+	)
+	test := func(kind int) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		oldPeer := "yrzKKRBu" // "nats-1"
+		n.addPeer(nats0)
+		n.addPeer(oldPeer)
+		require_Len(t, len(n.peers), 3)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		removePeer := newEntry(EntryRemovePeer, []byte(oldPeer))
+
+		if kind == KindLeader {
+			n.switchToLeader()
+			n.sendMembershipChange(removePeer)
+		} else {
+			// Store a normal entry, then an uncommitted AddPeer entry.
+			ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+			ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{removePeer}})
+			aesub := n.aesub
+			if kind == KindRestart {
+				aesub = nil
+			}
+			n.processAppendEntry(ae1, aesub)
+			n.processAppendEntry(ae2, aesub)
+		}
+
+		// The peer is gone and quorum shrank.
+		_, ok := n.peers[oldPeer]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_Equal(t, n.qn, 2)
+		_, ok = n.removed[oldPeer]
+		require_False(t, ok)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+		require_Equal(t, n.membChange.peer, oldPeer)
+		require_NotNil(t, n.membChange.prev)
+
+		// Truncate the uncommitted RemovePeer entry. Its speculative effects must be reverted.
+		n.truncateWAL(1, 1)
+		_, ok = n.peers[oldPeer]
+		require_True(t, ok)
+		require_Equal(t, n.csz, 3)
+		require_Equal(t, n.qn, 2)
+		_, ok = n.removed[oldPeer]
+		require_False(t, ok)
+		require_True(t, n.membChange == nil)
+	}
+
+	t.Run("Leader", func(t *testing.T) { test(KindLeader) })
+	t.Run("Follower", func(t *testing.T) { test(KindFollower) })
+	t.Run("Restart", func(t *testing.T) { test(KindRestart) })
+}
+
 func TestNRGResetWALClearsPendingAppendEntryCache(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -4683,17 +4806,17 @@ func TestNRGUncommittedMembershipChangeGetsTruncated(t *testing.T) {
 	n.processAppendEntry(aeAddPeer, n.aesub)
 	require_Equal(t, n.pindex, 2)
 	require_True(t, n.MembershipChangeInProgress())
-	require_Equal(t, n.membChangeIndex, 2)
+	require_Equal(t, n.membChange.index, 2)
 
 	// If the entry containing the membership change isn't truncated, it should remain in progress.
 	n.truncateWAL(n.pterm, n.pindex)
 	require_True(t, n.MembershipChangeInProgress())
-	require_Equal(t, n.membChangeIndex, 2)
+	require_Equal(t, n.membChange.index, 2)
 
 	// If the entry IS truncated, then it shouldn't be in progress anymore.
 	n.truncateWAL(n.pterm, n.pindex-1)
 	require_False(t, n.MembershipChangeInProgress())
-	require_Equal(t, n.membChangeIndex, 0)
+	require_True(t, n.membChange == nil)
 }
 
 func TestNRGUncommittedMembershipChangeOnNewLeaderForwardedRemovePeerProposal(t *testing.T) {
