@@ -433,7 +433,11 @@ func initSingleMemRaftNodeWithCluster(t *testing.T) (*raft, *cluster) {
 	t.Helper()
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	s := c.servers[0] // RunBasicJetStreamServer not available
+	return initMemRaftNodeWithServer(t, s), c
+}
 
+func initMemRaftNodeWithServer(t *testing.T, s *Server) *raft {
+	t.Helper()
 	ms, err := newMemStore(&StreamConfig{Name: "TEST", Storage: MemoryStorage})
 	require_NoError(t, err)
 	cfg := &RaftConfig{Name: "TEST", Store: t.TempDir(), Log: ms}
@@ -443,8 +447,7 @@ func initSingleMemRaftNodeWithCluster(t *testing.T) (*raft, *cluster) {
 	require_NoError(t, err)
 	n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
 	require_NoError(t, err)
-
-	return n, c
+	return n
 }
 
 // Encode an AppendEntry.

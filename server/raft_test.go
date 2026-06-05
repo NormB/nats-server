@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -4969,6 +4970,62 @@ func TestNRGUncommittedMembershipChangeOnNewLeader(t *testing.T) {
 
 	err := n.ProposeRemovePeer(nats1)
 	require_Error(t, err, errMembershipChange)
+}
+
+func TestNRGPeerStateDesyncOnNewLeader(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	leader := initMemRaftNodeWithServer(t, c.servers[0])
+	defer leader.Stop()
+	follower := initMemRaftNodeWithServer(t, c.servers[1])
+	defer follower.Stop()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+	nats2 := "cnrtt3eg" // "nats-2"
+
+	// Both nodes start out knowing peer set {nats0, nats1}.
+	for _, n := range []*raft{leader, follower} {
+		n.Lock()
+		n.peers = map[string]*lps{}
+		n.addPeer(nats0)
+		n.addPeer(nats1)
+		n.Unlock()
+	}
+
+	knownPeers := []string{nats0, nats1}
+	validatePeers := func(n *raft) {
+		t.Helper()
+		peers := n.peerNames()
+		slices.Sort(peers)
+		slices.Sort(knownPeers)
+		require_Equal(t, strings.Join(peers, ","), strings.Join(knownPeers, ","))
+	}
+	validatePeers(leader)
+	validatePeers(follower)
+
+	// Plant the same uncommitted EntryPeerState in both logs. Replacing nats1 with nats2.
+	knownPeers = []string{nats0, nats2}
+	ps := &peerState{knownPeers, 2, extNotExtended}
+	entries := []*Entry{newEntry(EntryPeerState, encodePeerState(ps))}
+	ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	leader.processAppendEntry(ae, leader.aesub)
+	require_Equal(t, leader.pindex, 1)
+	follower.processAppendEntry(ae, follower.aesub)
+	require_Equal(t, follower.pindex, 1)
+
+	// One node becomes the new leader for the next term.
+	leader.term = 2
+	leader.switchToLeader()
+	require_Equal(t, leader.State(), Leader)
+
+	// Both nodes commit and apply the planted EntryPeerState at index 1.
+	require_NoError(t, leader.applyCommit(1))
+	require_NoError(t, follower.applyCommit(1))
+
+	validatePeers(leader)
+	validatePeers(follower)
 }
 
 func TestNRGUncommittedMembershipChangeGetsTruncated(t *testing.T) {

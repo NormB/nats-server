@@ -3615,10 +3615,8 @@ func (n *raft) applyCommit(index uint64) error {
 				})
 			}
 		case EntryPeerState:
-			if n.State() != Leader {
-				if ps, err := decodePeerState(e.Data); err == nil {
-					n.processPeerState(ps)
-				}
+			if ps, err := decodePeerState(e.Data); err == nil {
+				n.processPeerState(ps)
 			}
 		case EntryAddPeer:
 			newPeer := string(e.Data)
