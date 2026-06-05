@@ -202,6 +202,9 @@ func (c *cluster) createRaftGroupWithPeers(name string, servers []*Server, smf s
 			Log:   c.createWAL(name, st)}
 		sg = append(sg, c.createStateMachine(s, cfg, peers, smf))
 	}
+
+	// Start campaigning early to speed up bootstrap leader election.
+	sg[0].node().CampaignImmediately()
 	return sg
 }
 
