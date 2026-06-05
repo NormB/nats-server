@@ -193,7 +193,7 @@ type raft struct {
 	applied   uint64 // Index of the most recently applied commit
 	papplied  uint64 // First sequence of our log, matches when we last installed a snapshot.
 
-	membChangeIndex uint64 // Index of uncommitted membership change entry (0 means no change in progress)
+	membChange *membChange // Uncommitted membership change entry at a specific log index.
 
 	aflr uint64 // Index when to signal initial messages have been applied after becoming leader. 0 means signaling is disabled.
 
@@ -276,6 +276,12 @@ type lps struct {
 	ts time.Time // Last timestamp
 	li uint64    // Last index replicated
 	kp bool      // Known peer
+}
+
+type membChange struct {
+	index uint64 // Which entry in the log is the membership change.
+	peer  string // The peer whose membership is being changed.
+	prev  *lps   // The previous membership state if removing, unset if adding.
 }
 
 const (
@@ -1010,7 +1016,7 @@ func (n *raft) ProposeAddPeer(peer string) error {
 		n.RUnlock()
 		return werr
 	}
-	if n.membChangeIndex > 0 {
+	if n.membChange != nil {
 		n.RUnlock()
 		return errMembershipChange
 	}
@@ -1040,7 +1046,7 @@ func (n *raft) ProposeRemovePeer(peer string) error {
 		return nil
 	}
 
-	if n.membChangeIndex > 0 {
+	if n.membChange != nil {
 		n.RUnlock()
 		return errMembershipChange
 	}
@@ -1063,7 +1069,7 @@ func (n *raft) ProposeRemovePeer(peer string) error {
 func (n *raft) MembershipChangeInProgress() bool {
 	n.RLock()
 	defer n.RUnlock()
-	return n.membChangeIndex > 0
+	return n.membChange != nil
 }
 
 // ClusterSize reports back the total cluster size.
@@ -2991,7 +2997,7 @@ func (n *raft) handleForwardedRemovePeerProposal(sub *subscription, c *client, _
 		n.RUnlock()
 		return
 	}
-	if n.membChangeIndex > 0 {
+	if n.membChange != nil {
 		n.debug("Ignoring forwarded peer removal proposal, membership changing")
 		n.RUnlock()
 		return
@@ -3096,11 +3102,10 @@ func (n *raft) removePeer(peer string) {
 		n.removed = map[string]time.Time{}
 	}
 	n.removed[peer] = time.Now()
-	if _, ok := n.peers[peer]; ok {
-		delete(n.peers, peer)
-		n.adjustClusterSizeAndQuorum()
-		n.writePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
-	}
+
+	delete(n.peers, peer)
+	n.adjustClusterSizeAndQuorum()
+	n.writePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
 }
 
 // Build and send appendEntry request for the given entry that changes
@@ -3112,25 +3117,43 @@ func (n *raft) sendMembershipChange(e *Entry) bool {
 
 	// Only makes sense to call this with entries that change membership.
 	// Also, ignore if we're already changing membership.
-	if !e.ChangesMembership() || n.membChangeIndex > 0 {
+	if !e.ChangesMembership() || n.membChange != nil {
 		return false
 	}
 
 	// Set to the index where we will store the membership change.
 	// It needs to be before we send, since if we're cluster size 1 we try to commit immediately.
-	n.membChangeIndex = n.pindex + 1
+	peer := string(e.Data)
+	n.membChange = &membChange{index: n.pindex + 1, peer: peer}
+	ps := n.peers[peer]
+	// Ignore if the peer already exists (add) or is not found (remove).
+	if (e.Type == EntryAddPeer && ps != nil) || (e.Type == EntryRemovePeer && ps == nil) {
+		n.membChange = nil
+		return false
+	}
+	if e.Type == EntryRemovePeer {
+		n.membChange.prev = ps
+	}
 	err := n.sendAppendEntryLocked([]*Entry{e}, true)
 	if err != nil {
-		n.membChangeIndex = 0
+		n.membChange = nil
 		return false
 	}
 
 	if e.Type == EntryAddPeer {
-		n.addPeer(string(e.Data))
+		// Track directly, but wait for commit to be official
+		if _, ok := n.peers[peer]; !ok {
+			n.peers[peer] = &lps{time.Time{}, 0, false}
+			n.adjustClusterSizeAndQuorum()
+		}
 	}
 
 	if e.Type == EntryRemovePeer {
-		n.removePeer(string(e.Data))
+		// Track directly, but wait for commit to be official
+		if _, ok := n.peers[peer]; ok {
+			delete(n.peers, peer)
+			n.adjustClusterSizeAndQuorum()
+		}
 		if n.csz == 1 {
 			n.tryCommit(n.pindex)
 			return true
@@ -3639,7 +3662,7 @@ func (n *raft) applyCommit(index uint64) error {
 			committed = append(committed, e)
 
 			// We are done with this membership change
-			n.membChangeIndex = 0
+			n.membChange = nil
 
 		case EntryRemovePeer:
 			peer := string(e.Data)
@@ -3654,7 +3677,7 @@ func (n *raft) applyCommit(index uint64) error {
 			committed = append(committed, e)
 
 			// We are done with this membership change
-			n.membChangeIndex = 0
+			n.membChange = nil
 
 			// If this is us and we are the leader signal the caller
 			// to attempt to stepdown.
@@ -4034,8 +4057,25 @@ func (n *raft) truncateWAL(term, index uint64) {
 	}
 
 	// Check if we're truncating an uncommitted membership change.
-	if n.membChangeIndex > 0 && n.membChangeIndex > index {
-		n.membChangeIndex = 0
+	if n.membChange != nil && n.membChange.index > index {
+		peer := n.membChange.peer
+		if ps := n.membChange.prev; ps != nil {
+			// This was a removal, add it back.
+			n.peers[peer] = ps
+			// If we were on the removed list, reverse that here.
+			if n.removed != nil {
+				delete(n.removed, peer)
+				if len(n.removed) == 0 {
+					n.removed = nil
+				}
+			}
+		} else {
+			// This was an addition, remove it.
+			delete(n.peers, peer)
+		}
+		n.adjustClusterSizeAndQuorum()
+		n.writePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
+		n.membChange = nil
 	}
 }
 
@@ -4474,19 +4514,30 @@ CONTINUE:
 		case EntryAddPeer:
 			// When receiving or restoring, mark membership as changing.
 			// Set to the index where this entry was stored (pindex is now this entry's index)
-			n.membChangeIndex = n.pindex
 			if newPeer := string(e.Data); len(newPeer) == idLen {
 				// Track directly, but wait for commit to be official
+				n.membChange = &membChange{index: n.pindex, peer: newPeer}
 				if _, ok := n.peers[newPeer]; !ok {
 					n.peers[newPeer] = &lps{time.Time{}, 0, false}
 				}
+				n.adjustClusterSizeAndQuorum()
 				// Store our peer in our global peer map for all peers.
 				peers.LoadOrStore(newPeer, newPeer)
 			}
 		case EntryRemovePeer:
 			// When receiving or restoring, mark membership as changing.
 			// Set to the index where this entry was stored (pindex is now this entry's index)
-			n.membChangeIndex = n.pindex
+			if oldPeer := string(e.Data); len(oldPeer) == idLen {
+				// Track directly, but wait for commit to be official
+				ps, ok := n.peers[oldPeer]
+				if !ok {
+					ps = &lps{time.Time{}, 0, false}
+
+				}
+				n.membChange = &membChange{index: n.pindex, peer: oldPeer, prev: ps}
+				delete(n.peers, oldPeer)
+				n.adjustClusterSizeAndQuorum()
+			}
 		}
 	}
 
