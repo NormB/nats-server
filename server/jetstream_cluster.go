@@ -3517,6 +3517,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 					}
 				}
 			}
+			// We may have lost leadership while the restore was running.
+			if err == nil && !isLeader {
+				err = errNotLeader
+			}
 			if err != nil {
 				if mset != nil {
 					mset.delete()
@@ -3537,10 +3541,6 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				// Send response to the metadata leader. They will forward to the user as needed.
 				s.sendInternalMsgLocked(streamAssignmentSubj, _EMPTY_, nil, result)
 				return
-			}
-
-			if !isLeader {
-				panic("Finished restore but not leader")
 			}
 			// Trigger the stream followers to catchup.
 			if n = mset.raftNode(); n != nil {
