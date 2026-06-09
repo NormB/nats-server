@@ -2864,9 +2864,7 @@ func (c *client) processHeaderPub(arg, remaining []byte) error {
 		// Do this only for CLIENT connections.
 		if c.kind == CLIENT && c.pa.hdr > 0 && len(remaining) > 0 {
 			hdr := remaining[:min(len(remaining), c.pa.hdr)]
-			if td, ok := c.allowedMsgTraceDest(hdr, false); ok && td != _EMPTY_ {
-				c.initAndSendIngressErrEvent(hdr, td, ErrMaxPayload)
-			}
+			c.sendMsgTraceIngressErrEvent(hdr, ErrMaxPayload)
 		}
 		c.maxPayloadViolation(c.pa.size, maxPayload)
 		return ErrMaxPayload
@@ -4116,41 +4114,6 @@ func (c *client) pubAllowed(subject string) bool {
 	return c.pubAllowedFullCheck(subject, true, false)
 }
 
-// allowedMsgTraceDest returns the trace destination if present and authorized.
-// It only considers static publish permissions and does not consume dynamic
-// reply permissions because the client is not publishing the trace event itself.
-func (c *client) allowedMsgTraceDest(hdr []byte, hasLock bool) (string, bool) {
-	if len(hdr) == 0 {
-		return _EMPTY_, true
-	}
-	td := sliceHeader(MsgTraceDest, hdr)
-	if len(td) == 0 || bytes.Equal(td, traceDestDisabledAsBytes) {
-		return _EMPTY_, true
-	}
-	dest := bytesToString(td)
-	if c.kind == CLIENT {
-		if hasGWRoutedReplyPrefix(td) {
-			return dest, false
-		}
-		var acc *Account
-		var srv *Server
-		if !hasLock {
-			c.mu.Lock()
-		}
-		acc, srv = c.acc, c.srv
-		if !hasLock {
-			c.mu.Unlock()
-		}
-		if bytes.HasPrefix(td, clientNRGPrefix) && srv != nil && acc != srv.SystemAccount() {
-			return dest, false
-		}
-	}
-	if c.perms != nil && (c.perms.pub.allow != nil || c.perms.pub.deny != nil) && !c.pubAllowedFullCheck(dest, false, hasLock) {
-		return dest, false
-	}
-	return dest, true
-}
-
 // pubAllowedFullCheck checks on all publish permissioning depending
 // on the flag for dynamic reply permissions.
 func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bool {
@@ -4334,13 +4297,6 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 		if !c.pubAllowedFullCheck(string(c.pa.subject), true, true) {
 			c.mu.Unlock()
 			c.pubPermissionViolation(c.pa.subject)
-			return false, true
-		}
-	}
-	if c.pa.hdr > 0 {
-		if td, ok := c.allowedMsgTraceDest(msg[:c.pa.hdr], true); !ok {
-			c.mu.Unlock()
-			c.pubPermissionViolation(stringToBytes(td))
 			return false, true
 		}
 	}
@@ -4836,6 +4792,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	}
 	siAcc := si.acc
 	allowTrace := si.atrc
+	isMsgTraceResp := isResponse && si.mt != nil
 	acc.mu.RUnlock()
 
 	// We have a special case where JetStream pulls in all service imports through one export.
@@ -5004,6 +4961,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	c.in.rts = lrts[:0]
 
 	var skipProcessing bool
+	var mtrsi *serviceImport
 	// If message tracing enabled, add the service import trace.
 	if mt != nil {
 		mt.addServiceImportEvent(siAcc.GetName(), string(pacopy.subject), to)
@@ -5022,6 +4980,10 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 				// remote.
 				msg = c.setHeader(MsgTraceDest, MsgTraceDestDisabled, msg)
 			}
+		} else {
+			dest := mt.dest
+			defer func() { mt.dest = dest }()
+			mtrsi, msg = mt.setupResponseServiceImport(c, acc, si, msg)
 		}
 	}
 
@@ -5044,15 +5006,8 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	c.in.rts = orts
 	c.pa = pacopy
 
-	// Before we undo didDeliver based on tracing and last mile, mark in the c.pa which informs us of no responders status.
-	// If we override due to tracing and traceOnly we do not want to send back a no responders.
+	// Mark in the c.pa if the message was delivered or not (no responders status).
 	c.pa.delivered = didDeliver
-
-	// If this was a message trace but we skip last-mile delivery, we need to
-	// do the remove, so:
-	if mt != nil && traceOnly && didDeliver {
-		didDeliver = false
-	}
 
 	// Determine if we should remove this service import. This is for response service imports.
 	// We will remove if we did not deliver, or if we are a response service import and we are
@@ -5067,6 +5022,34 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 		acc.mu.Lock()
 		si.ts = time.Now().UnixNano()
 		acc.mu.Unlock()
+	}
+	// This is a message trace...
+	if mt != nil {
+		// If it was not routed anywhere, we can remove mtrsi that we created earlier.
+		mt.siMu.RLock()
+		remove := mt.rsi == nil
+		mt.siMu.RUnlock()
+		if remove {
+			reason := rsiOk
+			if !didDeliver {
+				reason = rsiNoDelivery
+			}
+			siAcc.removeRespServiceImport(mtrsi, reason)
+		}
+		// If we skip last-mile delivery, we need to remove the rsi that we
+		// may have created if there was a reply subject.
+		if rsi != nil && traceOnly {
+			shouldRemove = true
+		}
+
+	} else if isMsgTraceResp {
+		shouldRemove = false
+		if !strings.HasPrefix(si.to, replyPrefix) {
+			var evt MsgTraceEvent
+			if err := json.Unmarshal(msg, &evt); err == nil {
+				si.mt.handleRespServiceImport(&evt)
+			}
+		}
 	}
 
 	// Cleanup of a response service import
@@ -5595,16 +5578,6 @@ sendToRoutesOrLeafs:
 
 	// Copy off original pa in case it changes.
 	pa := c.pa
-
-	if mt != nil {
-		// We are going to replace "pa" with our copy of c.pa, but to restore
-		// to the original copy of c.pa, we need to save it again.
-		cpa := pa
-		msg = mt.setOriginAccountHeaderIfNeeded(c, acc, msg)
-		defer func() { c.pa = cpa }()
-		// Update pa with our current c.pa state.
-		pa = c.pa
-	}
 
 	// We address by index to avoid struct copy.
 	// We have inline structs for memory layout and cache coherency.
