@@ -4485,7 +4485,7 @@ func (c *client) handleGWReplyMap(msg []byte) bool {
 
 // Used to setup the response map for a service import request that has a reply subject.
 func (c *client) setupResponseServiceImport(acc *Account, si *serviceImport, tracking bool, header http.Header) *serviceImport {
-	rsi := si.acc.addRespServiceImport(acc, string(c.pa.reply), si, tracking, header)
+	rsi := si.acc.addRespServiceImport(acc, string(c.pa.reply), si, tracking, header, nil)
 	if si.latency != nil {
 		if c.rtt == 0 {
 			// We have a service import that we are tracking but have not established RTT.
@@ -4981,6 +4981,8 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 				msg = c.setHeader(MsgTraceDest, MsgTraceDestDisabled, msg)
 			}
 		} else {
+			// This code is invoked from a single thread so mutation of mt.dest
+			// here is safe.
 			dest := mt.dest
 			defer func() { mt.dest = dest }()
 			mtrsi, msg = mt.setupResponseServiceImport(c, acc, si, msg)

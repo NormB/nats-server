@@ -477,7 +477,12 @@ func (c *client) initMsgTrace(hdr []byte, ingressError error) (bool, *msgTrace) 
 	// Now that we have a valid `dest`, make sure this connection is allowed
 	// to publish to it.
 	if !c.allowedToPublishOnMsgTraceDest(srv, acc, dest) {
-		c.pubPermissionViolation(stringToBytes(dest))
+		// Send the error back only if CLIENT or LEAF, otherwise just log.
+		if kind == CLIENT || kind == LEAF {
+			c.pubPermissionViolation(stringToBytes(dest))
+		} else {
+			c.Errorf("Publish Violation - Subject %q", dest)
+		}
 		// Return `true, nil` to force skipping of message processing.
 		return true, nil
 	}
@@ -813,8 +818,7 @@ func (t *msgTrace) sendEvent() {
 }
 
 func (t *msgTrace) setupResponseServiceImport(c *client, acc *Account, si *serviceImport, msg []byte) (*serviceImport, []byte) {
-	rsi := si.acc.addRespServiceImport(acc, t.dest, si, false, nil)
-	rsi.mt = t
+	rsi := si.acc.addRespServiceImport(acc, t.dest, si, false, nil, t)
 	t.dest = rsi.from
 	t.siMu.Lock()
 	t.si = append(t.si, &msgTraceServiceImport{rsi, si.acc})
@@ -839,7 +843,7 @@ func (t *msgTrace) handleRespServiceImport(e *MsgTraceEvent) {
 		for _, rsi := range t.si {
 			rsi.acc.removeRespServiceImport(rsi.si, rsiOk)
 		}
-		t.si = nil
+		t.rsi, t.si = nil, nil
 	}
 }
 
@@ -866,11 +870,12 @@ func (t *msgTrace) updateRespServiceImport(e *MsgTraceEvent) {
 			// Bind it to the parent tree for this "hop" id.
 			prsi.tree[h] = rsi
 		}
-		// When dealing with the last section of the "hop" string...
-		if i == len(hops)-1 {
-			// Set the expected hops count based on the event's "Hops" field.
+		// When dealing with the last section of the `hop` string, we set the
+		// expected hops count based on the event's `Hops` field and bump the number
+		// of received trace messages on the parent's node. We do this only once
+		// per event (use rsi.hops == -1 as the indicator).
+		if rsi.hops == -1 && i == len(hops)-1 {
 			rsi.hops = e.Hops
-			// Bump the number of received trace messages from the parent node.
 			prsi.received++
 		}
 		prsi = rsi
