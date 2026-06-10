@@ -3811,6 +3811,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	a.updated = time.Now()
 	clients := a.getClientsLocked()
 	ajs := a.js
+	hasJsLimits := a.jsLimits != nil
 	a.mu.Unlock()
 
 	// Sort in chronological order so that most recent connections over the limit are pruned.
@@ -3833,7 +3834,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 			ajs = a.js
 			a.mu.Unlock()
 		}
-	} else if a.jsLimits != nil {
+	} else if hasJsLimits {
 		// We do not have JS enabled for this server, but the account has it enabled so setup
 		// our imports properly. This allows this server to proxy JS traffic correctly.
 		s.checkJetStreamExports()
