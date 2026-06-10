@@ -4048,9 +4048,11 @@ func buildInternalNkeyUser(uc *jwt.UserClaims, acts map[string]struct{}, acc *Ac
 	var p = buildPermissionsFromJwt(&uc.Permissions)
 	if p == nil {
 		nu.defaultPerms = true
+		acc.mu.RLock()
 		if acc.defaultPerms != nil {
 			p = acc.defaultPerms.clone()
 		}
+		acc.mu.RUnlock()
 	}
 	nu.Permissions = p
 	return nu

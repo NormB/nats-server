@@ -4253,3 +4253,37 @@ func TestRemoveAllServiceImportSubsNoRaceUnderConcurrentReaders(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+func TestAccountDefaultPermsRaceDuringAuth(t *testing.T) {
+	acc := NewAccount("foo")
+
+	// User claims with no permissions so buildInternalNkeyUser hits the
+	// acc.defaultPerms read path (p == nil).
+	uc := jwt.NewUserClaims("U" + strings.Repeat("A", 51))
+
+	var someClaims jwt.Permissions
+	someClaims.Pub.Allow.Add("foo")
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader: mimics authentication path.
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			_ = buildInternalNkeyUser(uc, nil, acc)
+		}
+	}()
+
+	// Writer: mimics updateAccountClaimsWithRefresh refreshing defaultPerms.
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			acc.mu.Lock()
+			acc.defaultPerms = buildPermissionsFromJwt(&someClaims)
+			acc.mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+}
