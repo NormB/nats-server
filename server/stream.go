@@ -1500,7 +1500,11 @@ func (jsa *jsAccount) subjectsOverlap(subjects []string, self *stream) bool {
 		if self != nil && mset == self {
 			continue
 		}
-		for _, subj := range mset.cfg.Subjects {
+		// Read the other stream's subjects under its cfgMu.
+		mset.cfgMu.RLock()
+		msubjects := mset.cfg.Subjects
+		mset.cfgMu.RUnlock()
+		for _, subj := range msubjects {
 			for _, tsubj := range subjects {
 				if SubjectsCollide(tsubj, subj) {
 					return true

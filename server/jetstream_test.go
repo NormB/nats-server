@@ -24089,3 +24089,64 @@ func TestJetStreamStreamConfigSourcesDataRace(t *testing.T) {
 		t.Fatal("timeout")
 	}
 }
+
+// Must be run with -race.
+func TestJetStreamStreamSubjectsOverlapDataRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	acc := s.globalAccount()
+	jsa := acc.js
+	require_NotNil(t, jsa)
+
+	// Stream A: the "other" stream whose cfg.Subjects gets concurrently
+	// updated while subjectsOverlap reads it.
+	msetA, err := acc.addStream(&StreamConfig{Name: "A", Subjects: []string{"a.>"}})
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: drive concurrent writes of msetA.cfg under cfgMu, exactly as
+	// updateConfig does (mset.cfg = *cfg under cfgMu).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ncfg := msetA.config()
+			ncfg.Subjects = []string{fmt.Sprintf("a.%d.>", i)}
+			// Mirror updateConfig's write: under mset.mu and mset.cfgMu.
+			msetA.mu.Lock()
+			msetA.cfgMu.Lock()
+			msetA.cfg = ncfg
+			msetA.cfgMu.Unlock()
+			msetA.mu.Unlock()
+		}
+	}()
+
+	// Reader: call the real subjectsOverlap under jsa.mu, which reads
+	// msetA.cfg.Subjects. self is nil so A is inspected.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			jsa.mu.RLock()
+			jsa.subjectsOverlap([]string{"b.>"}, nil)
+			jsa.mu.RUnlock()
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
