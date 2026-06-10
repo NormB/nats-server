@@ -1882,7 +1882,8 @@ func (s *Server) shutdownEventing() {
 	}
 	clearTimer(&s.sys.sweeper)
 	clearTimer(&s.sys.stmr)
-	rc := s.sys.resetCh
+	// We intentionally do not close resetCh. A sender that captured the channel
+	// may still attempt to send after the internal send loop has exited.
 	s.sys.resetCh = nil
 	wg := &s.sys.wg
 	s.mu.Unlock()
@@ -1902,9 +1903,6 @@ func (s *Server) shutdownEventing() {
 	})
 	// Turn everything off here.
 	s.sys = nil
-	// Make sure this is done after s.sys = nil, so that we don't
-	// get sends to closed channels on badly-timed config reloads.
-	close(rc)
 }
 
 // Request for our local connection count.

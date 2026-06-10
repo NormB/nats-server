@@ -4128,3 +4128,45 @@ func TestSendInternalAccountMsgWithReplyDoesNotMutateHeaderSlice(t *testing.T) {
 		t.Fatalf("hdr backing array was mutated by send:\n want: %q\n  got: %q", snapshot, got)
 	}
 }
+
+func TestEventsResetChSendNoPanicAfterShutdownEventing(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+
+	// Simulate a sender that grabbed the channel reference before it was nil-ed,
+	// exactly as the production senders do under s.mu.
+	s.mu.Lock()
+	if s.sys == nil || s.sys.resetCh == nil {
+		s.mu.Unlock()
+		t.Fatal("expected system eventing to be running")
+	}
+	rc := s.sys.resetCh
+	s.mu.Unlock()
+
+	// Drive eventing shutdown to completion. With the old code this closed rc.
+	s.shutdownEventing()
+
+	// Stand in for the (now exited) internal send loop so that, on a healthy
+	// open channel, the send can complete.
+	go func() { <-rc }()
+
+	// Perform the send using the same select-against-quitCh pattern as the
+	// production senders. On the buggy code rc is closed and this panics.
+	done := make(chan any, 1)
+	go func() {
+		defer func() { done <- recover() }()
+		select {
+		case rc <- struct{}{}:
+		case <-s.quitCh:
+		}
+	}()
+
+	select {
+	case r := <-done:
+		if r != nil {
+			t.Fatalf("send on resetCh panicked during shutdown: %v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("send on resetCh blocked unexpectedly")
+	}
+}
