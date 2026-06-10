@@ -2922,7 +2922,7 @@ func (s *Server) remoteLatencyUpdate(sub *subscription, _ *client, _ *Account, s
 	}
 	acc.mu.RLock()
 	si := acc.exports.responses[reply]
-	if si == nil {
+	if si == nil || si.latency == nil {
 		acc.mu.RUnlock()
 		return
 	}

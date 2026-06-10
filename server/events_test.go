@@ -4170,3 +4170,61 @@ func TestEventsResetChSendNoPanicAfterShutdownEventing(t *testing.T) {
 		t.Fatal("send on resetCh blocked unexpectedly")
 	}
 }
+
+func TestEventsRemoteLatencyUpdateNilLatency(t *testing.T) {
+	s, _ := runTrustedServer(t)
+	defer s.Shutdown()
+
+	// Enable internal events by setting a system account.
+	sacc, _ := createAccount(s)
+	require_NoError(t, s.setSystemAccount(sacc))
+
+	// Target account that will own the tracked response serviceImport.
+	acc, _ := createAccount(s)
+
+	// Construct the offending state directly: a response serviceImport with a
+	// .T-suffixed tracked reply, tracking enabled, but a nil latency.
+	reply := "_R_.abcdef.T"
+	si := &serviceImport{
+		acc:      acc,
+		from:     reply,
+		to:       reply,
+		response: true,
+		tracking: true, // tracking on, but...
+		latency:  nil,  // ...no latency object -> nil deref at si.latency.subject
+	}
+	acc.mu.Lock()
+	if acc.exports.responses == nil {
+		acc.exports.responses = make(map[string]*serviceImport)
+	}
+	acc.exports.responses[reply] = si
+	acc.mu.Unlock()
+
+	// Craft a remote latency measurement that resolves to this serviceImport.
+	rl := remoteLatency{
+		Account: acc.Name,
+		ReqId:   reply,
+	}
+	msg, err := json.Marshal(&rl)
+	require_NoError(t, err)
+
+	// On unfixed code this panics with a nil pointer dereference on
+	// si.latency.subject. With the fix it returns cleanly.
+	var recovered any
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				recovered = r
+				// The panic occurred while holding acc.mu.RLock() (taken just
+				// before the offending deref and released just after). Release
+				// it so the deferred s.Shutdown does not deadlock.
+				acc.mu.RUnlock()
+			}
+		}()
+		s.remoteLatencyUpdate(nil, nil, nil, "$SYS.LATENCY.M2."+reply, "", nil, msg)
+	}()
+
+	if recovered != nil {
+		t.Fatalf("remoteLatencyUpdate panicked on nil si.latency: %v", recovered)
+	}
+}
