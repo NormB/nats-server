@@ -4287,3 +4287,42 @@ func TestAccountDefaultPermsRaceDuringAuth(t *testing.T) {
 
 	wg.Wait()
 }
+
+// Must be run with -race.
+func TestAccountRemoveCbJSWriteRace(t *testing.T) {
+	opts := DefaultTestOptions
+	opts.Port = -1
+	opts.JetStream = true
+	opts.StoreDir = t.TempDir()
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	for i := range 50 {
+		name := fmt.Sprintf("ACC_%d", i)
+		acc, _ := s.LookupOrRegisterAccount(name)
+		require_NoError(t, acc.EnableJetStream(nil, nil))
+		// Confirm a.js is set, so removeCb will reach the `a.js = nil` write.
+		if !acc.JetStreamEnabled() {
+			t.Fatalf("expected JetStream enabled (a.js != nil) for %s", name)
+		}
+
+		var stop atomic.Bool
+		done := make(chan struct{})
+		// Reader: read a.js under a.mu.RLock, exactly like maxBytesLimits does.
+		go func(a *Account) {
+			defer close(done)
+			for !stop.Load() {
+				a.mu.RLock()
+				_ = a.js
+				a.mu.RUnlock()
+			}
+		}(acc)
+
+		// Writer: removeCb sets `a.js = nil`, which must synchronize with the
+		// locked read above.
+		removeCb(s, name)
+
+		stop.Store(true)
+		<-done
+	}
+}

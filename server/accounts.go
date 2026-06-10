@@ -4375,7 +4375,9 @@ func removeCb(s *Server, pubKey string) {
 		// Remove JetStream state in memory, this will be reset
 		// on the changed callback from the account in case it is
 		// enabled again.
+		a.mu.Lock()
 		a.js = nil
+		a.mu.Unlock()
 	}
 	// We also need to remove all ServerImport subscriptions
 	a.removeAllServiceImportSubs()
