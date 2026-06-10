@@ -4512,20 +4512,20 @@ func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
 		// are behind and have specified a reply subject, so let's try to catch them up.
 		// In this case ar.term was populated with the remote's pterm.
 		n.catchupFollower(ar)
-	} else if ar.term > n.term {
-		// The remote node didn't commit the append entry, it looks like
-		// they are on a newer term than we are. Step down.
-		// In this case ar.term was populated with the remote's term.
-		n.Lock()
-		n.term = ar.term
-		n.vote = noVote
-		n.writeTermVote()
-		n.warn("Detected another leader with higher term, will stepdown")
-		n.stepdownLocked(noLeader)
-		n.Unlock()
-		arPool.Put(ar)
 	} else {
-		// Ignore, but return back to pool.
+		n.Lock()
+		if ar.term > n.term {
+			// The remote node didn't commit the append entry, it looks like
+			// they are on a newer term than we are. Step down.
+			// In this case ar.term was populated with the remote's term.
+			n.term = ar.term
+			n.vote = noVote
+			n.writeTermVote()
+			n.warn("Detected another leader with higher term, will stepdown")
+			n.stepdownLocked(noLeader)
+		}
+		n.Unlock()
+		// Either way, return back to pool.
 		arPool.Put(ar)
 	}
 }

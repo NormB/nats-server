@@ -6288,3 +6288,58 @@ func TestNRGCatchupFollowerNoWaitGroupLeakWhenGoRoutineFails(t *testing.T) {
 		t.Fatal("progress map entry for the follower leaked after failed catchup")
 	}
 }
+
+// Must be run with -race.
+func TestNRGProcessAppendEntryResponseTermRace(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Use this node's own id as the peer so trackPeer is happy.
+	peer := n.id
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer goroutine: write n.term under n.Lock, exactly as raft.Reset does.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := uint64(0); ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n.Lock()
+			n.term = i
+			n.Unlock()
+		}
+	}()
+
+	// Reader goroutine: call processAppendEntryResponse with an ar that reaches
+	// the unlocked `ar.term > n.term` comparison. ar.success=false and
+	// ar.reply=="" route us past the earlier branches to that read.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ar := &appendEntryResponse{
+				term:    0, // 0 > n.term is false, so the heavy stepdown branch is skipped.
+				index:   0,
+				peer:    peer,
+				reply:   _EMPTY_,
+				success: false,
+			}
+			n.processAppendEntryResponse(ar)
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
