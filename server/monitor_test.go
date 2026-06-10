@@ -275,6 +275,63 @@ func TestMonitorVarzSubscriptionsResetProperly(t *testing.T) {
 	}
 }
 
+// Must be run with -race.
+func TestMonitorVarzReloadRace(t *testing.T) {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+
+	// Ensure s.varz is populated so the marshal path reads the shared object.
+	_, err := http.Get(url)
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader: hit /varz, which marshals s.varz under s.varzMu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				resp, err := http.Get(url)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}
+	}()
+
+	// Writer: reload, which mutates s.varz via updateVarzConfigReloadableFields.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if err := s.ReloadOptions(s.getOpts().Clone()); err != nil {
+					t.Errorf("Error on reload: %v", err)
+					return
+				}
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
 func TestMonitorHandleVarz(t *testing.T) {
 	s, _ := runMonitorJSServer(t, -1, -1, 0, 0)
 	defer s.Shutdown()

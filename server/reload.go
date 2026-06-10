@@ -1477,10 +1477,12 @@ func (s *Server) ReloadOptions(newOpts *Options) error {
 
 	s.recheckPinnedCerts(curOpts, newOpts)
 
+	s.varzMu.Lock()
 	s.mu.Lock()
 	s.configTime = time.Now().UTC()
 	s.updateVarzConfigReloadableFields(s.varz)
 	s.mu.Unlock()
+	s.varzMu.Unlock()
 	return nil
 }
 func applyBoolFlags(newOpts, flagOpts *Options) {
