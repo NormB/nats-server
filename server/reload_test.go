@@ -5432,6 +5432,30 @@ func TestConfigReloadRoutePoolAndPerAccount(t *testing.T) {
 	// Now add accounts "B" and "D" and do a config reload.
 	reloadUpdateConfig(t, srva, confA, fmt.Sprintf(confATemplate, "pool_size: 3", "accounts: [\"A\",\"B\",\"D\"]"))
 
+	// reloadClusterPoolAndAccounts must not let srva's Reload() return until the
+	// remotes have confirmed they processed the per-account route additions.
+	for _, s := range []*Server{srvb, srvc} {
+		for _, acc := range []string{"B", "D"} {
+			s.mu.RLock()
+			_, hasRoute := s.accRoutes[acc]
+			a, found := s.accounts.Load(acc)
+			s.mu.RUnlock()
+			if !hasRoute {
+				t.Fatalf("%s.Reload() returned before remote %s set up the per-account route for %q; the route confirmation wait was skipped", srva, s, acc)
+			}
+			if !found {
+				t.Fatalf("Remote %s does not know account %q", s, acc)
+			}
+			acc := a.(*Account)
+			acc.mu.RLock()
+			rpi := acc.routePoolIdx
+			acc.mu.RUnlock()
+			if rpi != accTransitioningToDedicatedRoute {
+				t.Fatalf("%s.Reload() returned before remote %s marked account %q transitioning (routePoolIdx=%d); the route confirmation wait was skipped", srva, s, acc.Name, rpi)
+			}
+		}
+	}
+
 	// Even before reloading srvb and srvc, we should already have per-account
 	// routes for accounts B and D being established. The accounts routePoolIdx
 	// should be marked as transitioning.
