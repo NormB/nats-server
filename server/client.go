@@ -946,7 +946,7 @@ func (c *client) applyAccountLimits() {
 				if scope, ok := c.acc.hasIssuer(uc.Issuer); ok {
 					if userScope, ok := scope.(*jwt.UserScope); ok {
 						// if signing key disappeared or changed and we don't get here, the client will be disconnected
-						c.mpay = clampInt64ToInt32(userScope.Template.Limits.Payload)
+						atomic.StoreInt32(&c.mpay, clampInt64ToInt32(userScope.Template.Limits.Payload))
 						c.msubs = clampInt64ToInt32(userScope.Template.Limits.Subs)
 					}
 				}
@@ -970,7 +970,7 @@ func (c *client) applyAccountLimits() {
 	if mSubs == 0 {
 		mSubs = jwt.NoLimit
 	}
-	wasUnlimited := c.mpay == jwt.NoLimit
+	wasUnlimited := atomic.LoadInt32(&c.mpay) == jwt.NoLimit
 	if minLimit(&c.mpay, mPay) && !wasUnlimited {
 		c.Debugf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
 	}
@@ -2644,7 +2644,7 @@ func (c *client) generateClientInfoJSON(info Info, includeClientIP bool) []byte 
 	if includeClientIP {
 		info.ClientIP = c.host
 	}
-	info.MaxPayload = c.mpay
+	info.MaxPayload = atomic.LoadInt32(&c.mpay)
 	if c.isWebsocket() {
 		info.ClientConnectURLs = info.WSConnectURLs
 		// Otherwise lame duck info can panic

@@ -12843,3 +12843,36 @@ func TestJetStreamConsumerUpdateConfigStopRace(t *testing.T) {
 		_ = o.stop()
 	}
 }
+
+// Must be run with -race.
+func TestJetStreamConsumerSetRateLimitAccountMpayRace(t *testing.T) {
+	acc := &Account{Name: "A"}
+	acc.mpay = 1024
+	mset := &stream{jsa: &jsAccount{account: acc}}
+	o := &consumer{mset: mset}
+
+	const iters = 1000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader: repeatedly sets the rate limit, reading acc.mpay for the burst.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			o.setRateLimit(8 * 1024)
+		}
+	}()
+
+	// Writer: mimics updateAccountClaimsWithRefresh updating account limits
+	// under the account lock.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			acc.mu.Lock()
+			acc.mpay = 2048
+			acc.mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+}

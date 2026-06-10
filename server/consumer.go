@@ -2430,11 +2430,16 @@ func (o *consumer) setRateLimit(bps uint64) {
 	// is already invoked under mset.mu.RLock(), which superseeds cfgMu.
 	if mset.cfg.MaxMsgSize > 0 {
 		burst = int(mset.cfg.MaxMsgSize)
-	} else if mset.jsa.account.limits.mpay > 0 {
-		burst = int(mset.jsa.account.limits.mpay)
 	} else {
-		s := mset.jsa.account.srv
-		burst = int(s.getOpts().MaxPayload)
+		acc := mset.jsa.account
+		acc.mu.RLock()
+		mpay := acc.mpay
+		acc.mu.RUnlock()
+		if mpay > 0 {
+			burst = int(mpay)
+		} else {
+			burst = int(acc.srv.getOpts().MaxPayload)
+		}
 	}
 
 	o.rlimit = rate.NewLimiter(rl, burst)
