@@ -2784,6 +2784,97 @@ func TestClientApplyAccountLimitsSigningKeysRace(t *testing.T) {
 	wg.Wait()
 }
 
+// Must be run with -race.
+func TestClientApplyAccountLimitsMpayAtomicRace(t *testing.T) {
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	skp, _ := nkeys.CreateAccount()
+	spub, _ := skp.PublicKey()
+
+	// Build a user JWT issued by the signing key on behalf of the account.
+	nkp, _ := nkeys.CreateUser()
+	upub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(upub)
+	nuc.IssuerAccount = apub // != Issuer (spub) so the scoped signingKeys branch runs
+	nuc.Limits.Payload = 2048
+	nuc.Limits.Subs = 20
+	ujwt, err := nuc.Encode(skp)
+	require_NoError(t, err)
+
+	// The scope stored in the account's signing keys map, carrying a Payload
+	// template so applyAccountLimits writes c.mpay on every call.
+	scope := jwt.NewUserScope()
+	scope.Key = spub
+	scope.Template.Limits.Payload = 1024
+	scope.Template.Limits.Subs = 10
+
+	acc := &Account{Name: apub, Issuer: apub}
+	acc.mpay = jwt.NoLimit
+	acc.msubs = jwt.NoLimit
+	acc.signingKeys = map[string]jwt.Scope{spub: scope}
+
+	srv := &Server{opts: &Options{}}
+	c := &client{srv: srv, acc: acc, kind: CLIENT}
+	c.opts.JWT = ujwt
+
+	// Sanity: ensure we actually hit the scoped-signing-key branch.
+	c.applyAccountLimits()
+	if got := atomic.LoadInt32(&c.mpay); got != 1024 {
+		t.Fatalf("expected scoped template payload 1024, got %d", got)
+	}
+
+	const iters = 1000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Writer: repeatedly applies account limits, writing c.mpay.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			c.applyAccountLimits()
+		}
+	}()
+
+	// Reader: mimics processPub's atomic read of c.mpay.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			_ = atomic.LoadInt32(&c.mpay)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// Must be run with -race.
+func TestClientGenerateClientInfoJSONMpayAtomicRace(t *testing.T) {
+	c := &client{}
+	c.mpay = 1024
+
+	const iters = 1000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader: generates the client INFO, reading c.mpay.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			_ = c.generateClientInfoJSON(Info{}, false)
+		}
+	}()
+
+	// Writer: mimics maxPayloadOption.Apply on config reload, which stores
+	// c.mpay atomically while holding only the server lock.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			atomic.StoreInt32(&c.mpay, 2048)
+		}
+	}()
+
+	wg.Wait()
+}
+
 func TestClientClampMaxSubsErrReport(t *testing.T) {
 	maxSubLimitReportThreshold = int64(100 * time.Millisecond)
 	defer func() { maxSubLimitReportThreshold = defaultMaxSubLimitReportThreshold }()
