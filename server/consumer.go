@@ -4315,7 +4315,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 			// Track whether this iteration just claimed a new pin for this request.
 			assignedPin := false
 			if needNewPin {
-				if wr.priorityGroup.Id == _EMPTY_ {
+				if wr.priorityGroup == nil || wr.priorityGroup.Id == _EMPTY_ {
 					o.assignNewPinId(wr)
 					assignedPin = true
 				} else {
@@ -4334,7 +4334,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				// Check if we have a match on the currentNuid
 				if wr.priorityGroup != nil && wr.priorityGroup.Id == o.currentPinId {
 					// If we have a match, we do nothing here and will deliver the message later down the code path.
-				} else if wr.priorityGroup.Id == _EMPTY_ {
+				} else if wr.priorityGroup == nil || wr.priorityGroup.Id == _EMPTY_ {
 					o.waiting.cycle()
 					numCycled++
 					if numCycled >= o.waiting.len() {

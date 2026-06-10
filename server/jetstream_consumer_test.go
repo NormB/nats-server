@@ -1709,6 +1709,51 @@ func TestJetStreamConsumerPinned(t *testing.T) {
 	require_NoError(t, err)
 }
 
+func TestJetStreamConsumerPinnedPlainRequestNoPanic(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:        "C",
+		FilterSubject:  "foo",
+		PriorityGroups: []string{"A"},
+		PriorityPolicy: PriorityPinnedClient,
+		AckPolicy:      AckExplicit,
+		PinnedTTL:      10 * time.Second,
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("msg"))
+	require_NoError(t, err)
+
+	reply := "PLAIN"
+	replies, err := nc.SubscribeSync(reply)
+	require_NoError(t, err)
+	defer replies.Drain()
+
+	// Send a plain pull request: a bare batch number, not JSON with a priority
+	// group. This results in a nil priorityGroup for a pinned consumer.
+	require_NoError(t, nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.C", reply, []byte("1")))
+
+	// The server must not panic and should deliver the message.
+	msg, err := replies.NextMsg(2 * time.Second)
+	require_NoError(t, err)
+	require_NotNil(t, msg)
+	require_Equal(t, string(msg.Data), "msg")
+
+	// Ensure the server is still alive after the request.
+	require_NoError(t, nc.Flush())
+}
+
 func TestJetStreamConsumerPinnedUnsetsAfterAtMostPinnedTTL(t *testing.T) {
 	test := func(t *testing.T, publish bool) {
 		s := RunBasicJetStreamServer(t)
