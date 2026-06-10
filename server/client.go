@@ -943,7 +943,7 @@ func (c *client) applyAccountLimits() {
 			atomic.StoreInt32(&c.mpay, clampInt64ToInt32(uc.Limits.Payload))
 			c.msubs = clampInt64ToInt32(uc.Limits.Subs)
 			if uc.IssuerAccount != _EMPTY_ && uc.IssuerAccount != uc.Issuer {
-				if scope, ok := c.acc.signingKeys[uc.Issuer]; ok {
+				if scope, ok := c.acc.hasIssuer(uc.Issuer); ok {
 					if userScope, ok := scope.(*jwt.UserScope); ok {
 						// if signing key disappeared or changed and we don't get here, the client will be disconnected
 						c.mpay = clampInt64ToInt32(userScope.Template.Limits.Payload)

@@ -2725,6 +2725,65 @@ func TestClientLimits(t *testing.T) {
 	}
 }
 
+// Must be run with -race.
+func TestClientApplyAccountLimitsSigningKeysRace(t *testing.T) {
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	skp, _ := nkeys.CreateAccount()
+	spub, _ := skp.PublicKey()
+
+	// Build a user JWT issued by the signing key on behalf of the account.
+	nkp, _ := nkeys.CreateUser()
+	upub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(upub)
+	nuc.IssuerAccount = apub // != Issuer (spub) so the signingKeys lookup runs
+	nuc.Limits.Payload = jwt.NoLimit
+	nuc.Limits.Subs = jwt.NoLimit
+	ujwt, err := nuc.Encode(skp)
+	require_NoError(t, err)
+
+	// The scope stored in the account's signing keys map.
+	scope := jwt.NewUserScope()
+	scope.Key = spub
+	scope.Template.Limits.Payload = jwt.NoLimit
+	scope.Template.Limits.Subs = jwt.NoLimit
+
+	acc := &Account{Name: apub, Issuer: apub}
+	acc.mpay = jwt.NoLimit
+	acc.msubs = jwt.NoLimit
+	acc.signingKeys = map[string]jwt.Scope{spub: scope}
+
+	srv := &Server{opts: &Options{}}
+	c := &client{srv: srv, acc: acc, kind: CLIENT}
+	c.opts.JWT = ujwt
+
+	const iters = 1000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader: repeatedly applies account limits, reading acc.signingKeys.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			c.applyAccountLimits()
+		}
+	}()
+
+	// Writer: mimics updateAccountClaimsWithRefresh rebuilding signingKeys.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			acc.mu.Lock()
+			acc.signingKeys = make(map[string]jwt.Scope)
+			acc.signingKeys[spub] = scope
+			acc.signingKeys[acc.Name] = nil
+			acc.mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+}
+
 func TestClientClampMaxSubsErrReport(t *testing.T) {
 	maxSubLimitReportThreshold = int64(100 * time.Millisecond)
 	defer func() { maxSubLimitReportThreshold = defaultMaxSubLimitReportThreshold }()
