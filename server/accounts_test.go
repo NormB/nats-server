@@ -4216,3 +4216,40 @@ func TestStreamActivationExpiredNoMatchDoesNotInvalidate(t *testing.T) {
 		t.Fatalf("unrelated stream import was wrongly invalidated on no match")
 	}
 }
+
+func TestRemoveAllServiceImportSubsNoRaceUnderConcurrentReaders(t *testing.T) {
+	for range 2000 {
+		a := &Account{}
+		a.imports.services = make(map[string][]*serviceImport)
+		for i := 0; i < 8; i++ {
+			si := &serviceImport{sid: []byte("sid")}
+			a.imports.services[fmt.Sprintf("svc.%d", i)] = []*serviceImport{si}
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Reader: mimics updateAccountClaimsWithRefresh reading a.ic and
+		// iterating si.sid under a read lock.
+		go func() {
+			defer wg.Done()
+			a.mu.RLock()
+			_ = a.ic
+			for _, sis := range a.imports.services {
+				for _, si := range sis {
+					_ = si.sid
+				}
+			}
+			a.mu.RUnlock()
+		}()
+
+		// Writer: nils si.sid and a.ic. a.ic is nil so the post-unlock
+		// path returns early and does not touch a real client.
+		go func() {
+			defer wg.Done()
+			a.removeAllServiceImportSubs()
+		}()
+
+		wg.Wait()
+	}
+}

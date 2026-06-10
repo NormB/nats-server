@@ -2203,7 +2203,7 @@ func (a *Account) addServiceImportSub(si *serviceImport) error {
 
 // Remove all the subscriptions associated with service imports.
 func (a *Account) removeAllServiceImportSubs() {
-	a.mu.RLock()
+	a.mu.Lock()
 	var sids [][]byte
 	for _, sis := range a.imports.services {
 		for _, si := range sis {
@@ -2215,7 +2215,7 @@ func (a *Account) removeAllServiceImportSubs() {
 	}
 	c := a.ic
 	a.ic = nil
-	a.mu.RUnlock()
+	a.mu.Unlock()
 
 	if c == nil {
 		return
