@@ -3257,9 +3257,12 @@ func (n *raft) runCatchup(ar *appendEntryResponse, indexUpdatesQ *ipQueue[uint64
 
 	defer func() {
 		n.Lock()
-		delete(n.progress, peer)
-		if len(n.progress) == 0 {
-			n.progress = nil
+		// Only remove our own progress entry.
+		if q, ok := n.progress[peer]; ok && q == indexUpdatesQ {
+			delete(n.progress, peer)
+			if len(n.progress) == 0 {
+				n.progress = nil
+			}
 		}
 		// Check if this is a new peer and if so go ahead and propose adding them.
 		_, exists := n.peers[peer]

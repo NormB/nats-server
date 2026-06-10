@@ -6160,3 +6160,79 @@ func TestNRGBootstrapExpectedClusterSize(t *testing.T) {
 		})
 	}
 }
+
+func TestNRGCatchupRerequestDoesNotOrphanProgressQueue(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Use large entries so a catchup run exceeds its outstanding limit and
+	// must block waiting for index updates instead of finishing immediately.
+	msg := make([]byte, 1024*1024)
+	entries := []*Entry{newEntry(EntryNormal, msg)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 2, entries: entries})
+	require_NoError(t, n.storeToWAL(aeMsg1))
+	require_NoError(t, n.storeToWAL(aeMsg2))
+	require_NoError(t, n.storeToWAL(aeMsg3))
+
+	// Switching to leader stores a peer state entry at index 4.
+	n.term = 1
+	n.switchToLeader()
+	require_Equal(t, n.pindex, 4)
+
+	// Follower requests a catchup, which starts a catchup run that blocks
+	// waiting for index updates after sending up to 2MB of entries.
+	n.catchupFollower(&appendEntryResponse{term: 1, index: 0, peer: nats1, reply: "$NRG.CR.TEST.1"})
+	n.RLock()
+	q1 := n.progress[nats1]
+	n.RUnlock()
+	require_True(t, q1 != nil)
+
+	// Wait for the first run to consume the initial index update, so we know
+	// it has started and captured its view of the last index (4) before we
+	// store more entries below.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		if q1.len() > 0 {
+			return errors.New("first catchup run has not started yet")
+		}
+		return nil
+	})
+
+	// Store another entry so the cancel signal pushed by the re-request below
+	// (n.pindex) exceeds the first run's view of the last index, making the
+	// first run return promptly instead of waiting for its stall timeout.
+	aeMsg4 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 4, entries: entries})
+	require_NoError(t, n.storeToWAL(aeMsg4))
+
+	// Follower re-requests the catchup while the first run is still active.
+	// This cancels the first run and installs a fresh progress queue.
+	n.catchupFollower(&appendEntryResponse{term: 1, index: 0, peer: nats1, reply: "$NRG.CR.TEST.2"})
+	n.RLock()
+	q2 := n.progress[nats1]
+	n.RUnlock()
+	require_True(t, q2 != nil)
+	require_True(t, q1 != q2)
+
+	// Wait for the first run's deferred cleanup. On exit it proposes adding
+	// the (unknown) peer, which is observable on the proposal queue since the
+	// run loop isn't started in this test.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		if n.prop.len() == 0 {
+			return errors.New("first catchup run still active")
+		}
+		return nil
+	})
+
+	// The first run's cleanup must only remove its own progress queue. If it
+	// removed the re-requested run's queue, index updates would no longer
+	// reach that run and the catchup would stall.
+	n.RLock()
+	q := n.progress[nats1]
+	n.RUnlock()
+	require_True(t, q == q2)
+}
