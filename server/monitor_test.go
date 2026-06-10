@@ -6955,3 +6955,83 @@ func TestMetaClusterInfoSnapshotStats(t *testing.T) {
 	require_True(t, m.Stats.JetStream.Meta != nil)
 	require_True(t, m.Stats.JetStream.Meta.Snapshot != nil)
 }
+
+func TestMonitorConnzAccountRace(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	accA, err := s.LookupAccount("A")
+	if err != nil {
+		t.Fatalf("LookupAccount A: %v", err)
+	}
+	accB, err := s.LookupAccount("B")
+	if err != nil {
+		t.Fatalf("LookupAccount B: %v", err)
+	}
+
+	// Real client bound to account A.
+	nc := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer nc.Close()
+
+	// Grab the server-side *client.
+	var c *client
+	checkFor(t, 2*time.Second, 5*time.Millisecond, func() error {
+		accA.mu.RLock()
+		defer accA.mu.RUnlock()
+		for cl := range accA.clients {
+			c = cl
+			return nil
+		}
+		return errors.New("could not find server-side client for account A")
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: write c.acc under c.mu, mimicking registerWithAccount /
+	// swapAccountAfterReload binding/swapping an account.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			c.mu.Lock()
+			if c.acc == accA {
+				c.acc = accB
+			} else {
+				c.acc = accA
+			}
+			c.mu.Unlock()
+		}
+	}()
+
+	// Reader: account-filter path reads client.acc / client.acc.Name under only s.mu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := s.Connz(&ConnzOptions{Account: "A"}); err != nil {
+				t.Errorf("Connz error: %v", err)
+				return
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Restore so shutdown/cleanup is consistent.
+	c.mu.Lock()
+	c.acc = accA
+	c.mu.Unlock()
+}
