@@ -2878,8 +2878,9 @@ func (a *Account) streamActivationExpired(exportAcc *Account, subject string) {
 		return
 	}
 	var si *streamImport
-	for _, si = range a.imports.streams {
-		if si.acc == exportAcc && si.from == subject {
+	for _, im := range a.imports.streams {
+		if im.acc == exportAcc && im.from == subject {
+			si = im
 			break
 		}
 	}
