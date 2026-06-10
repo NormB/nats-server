@@ -1584,6 +1584,10 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 			purged = ms.state.Msgs
 		}
 		ms.state.Msgs -= purged
+		if ms.state.Msgs == 0 {
+			ms.state.FirstSeq = ms.state.LastSeq + 1
+			ms.state.FirstTime = time.Time{}
+		}
 		if bytes > ms.state.Bytes {
 			bytes = ms.state.Bytes
 		}

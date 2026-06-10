@@ -576,6 +576,41 @@ func TestStoreCompactCleansUpDmap(t *testing.T) {
 	}
 }
 
+func TestStoreCompactFullyDeletedRange(t *testing.T) {
+	config := func() StreamConfig {
+		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgsPer: 0}
+	}
+	testAllStoreAllPermutations(
+		t, false, config(),
+		func(t *testing.T, fs StreamStore) {
+			// Publish some messages.
+			for range 3 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+			}
+
+			// Remove all messages in the range we're about to compact,
+			// keeping the first message so FirstSeq stays at 1.
+			_, err := fs.RemoveMsg(2)
+			require_NoError(t, err)
+			_, err = fs.RemoveMsg(3)
+			require_NoError(t, err)
+
+			state := fs.State()
+			require_Equal(t, state.FirstSeq, 1)
+			require_Equal(t, state.LastSeq, 3)
+
+			// Compact to a deleted sequence, and the stream is left empty.
+			_, err = fs.Compact(2)
+			require_NoError(t, err)
+			state = fs.State()
+			require_Equal(t, state.Msgs, 0)
+			require_Equal(t, state.LastSeq, 3)
+			require_Equal(t, state.FirstSeq, state.LastSeq+1)
+			require_True(t, state.FirstTime.IsZero())
+		})
+}
+
 func TestStoreTruncateCleansUpDmap(t *testing.T) {
 	config := func() StreamConfig {
 		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgsPer: 0}
