@@ -4782,7 +4782,9 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 		}
 		// Need to count these regardless as we might want to enable TTLs
 		// later via UpdateConfig.
+		fs.lmb.mu.Lock()
 		fs.lmb.ttls++
+		fs.lmb.mu.Unlock()
 	}
 
 	// Check if we have and need the age expiration timer running.
@@ -4797,8 +4799,10 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 	if fs.scheduling != nil {
 		if schedule, ok := getMessageSchedule(hdr); ok && !schedule.IsZero() {
 			fs.scheduling.add(seq, subj, schedule.UnixNano())
+			fs.lmb.mu.Lock()
 			fs.lmb.schedules++
-		} else {
+			fs.lmb.mu.Unlock()
+		} else if getMessageScheduler(hdr) == _EMPTY_ {
 			fs.scheduling.removeSubject(subj)
 		}
 	}

@@ -13148,3 +13148,69 @@ func TestFileStoreUpdateConfigSyncAlwaysRace(t *testing.T) {
 
 	wg.Wait()
 }
+
+// Must be run with -race.
+func TestFileStoreStoreRawMsgTTLsRace(t *testing.T) {
+	sd := t.TempDir()
+	fs, err := newFileStore(
+		// Large block size so all messages stay in a single block (== lmb),
+		// guaranteeing the storeRawMsg increments and the indexCacheBuf rewrite
+		// target the same message block.
+		FileStoreConfig{StoreDir: sd, BlockSize: 8 * 1024 * 1024, CacheExpire: time.Millisecond},
+		StreamConfig{Name: "zzz", Subjects: []string{"test"}, Storage: FileStorage, AllowMsgTTL: true},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Large TTL so messages don't actually expire/remove during the test.
+	ttl := int64(3600)
+	hdr := fmt.Appendf(nil, "NATS/1.0\r\n%s: %d\r\n\r\n", JSMessageTTL, ttl)
+
+	// Store an initial message so seq 1 exists and lives in the lmb.
+	_, _, err = fs.StoreMsg("test", hdr, []byte("hello"), ttl)
+	require_NoError(t, err)
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+
+	// Writers: store TTL messages into the lmb, each bumps fs.lmb.ttls++ under fs.mu only.
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				if _, _, err := fs.StoreMsg("test", hdr, []byte("hello"), ttl); err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	// Readers: force the lmb cache to drop and reload, which reindexes and rewrites
+	// mb.ttls/mb.schedules under mb.mu only.
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				fs.mu.RLock()
+				lmb := fs.lmb
+				fseq := atomic.LoadUint64(&lmb.first.seq)
+				fs.mu.RUnlock()
+				// Flush pending to disk then drop the cache so the next load
+				// re-reads the block and reindexes it.
+				lmb.mu.Lock()
+				lmb.flushPendingMsgsLocked()
+				lmb.clearCacheAndOffset()
+				lmb.mu.Unlock()
+				// Load a seq that lives in the lmb; triggers loadMsgsWithLock and
+				// indexCacheBuf, which rewrites mb.ttls/mb.schedules under mb.mu.
+				fs.LoadMsg(fseq, nil)
+			}
+		}()
+	}
+
+	time.Sleep(2 * time.Second)
+	stop.Store(true)
+	wg.Wait()
+}
