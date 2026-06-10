@@ -23873,6 +23873,78 @@ func TestJetStreamMirrorRetriesOnSeqAlreadySeenMismatch(t *testing.T) {
 	}
 }
 
+// Must be run with -race.
+func TestJetStreamHealthzConsumerCheckConcurrentMapRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	acc := s.globalAccount()
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	opts := &HealthzOptions{
+		Account:  acc.Name,
+		Stream:   "TEST",
+		Consumer: "MISSING",
+		Details:  true,
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: repeatedly create and delete consumers in the stream's map,
+	// holding mset.mu just like setConsumer/removeConsumer.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			name := fmt.Sprintf("C-%d", i)
+			i++
+			mset.mu.Lock()
+			mset.consumers[name] = &consumer{name: name}
+			mset.mu.Unlock()
+			mset.mu.Lock()
+			delete(mset.consumers, name)
+			mset.mu.Unlock()
+		}
+	}()
+
+	// Reader: hammer healthz which (on unfixed code) ranges mset.consumers
+	// without any lock.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = s.healthz(opts)
+		}
+	}()
+
+	// Let the goroutines race for a bounded amount of time.
+	time.Sleep(2 * time.Second)
+	close(stop)
+	wg.Wait()
+}
+
 // https://github.com/nats-io/nats-server/issues/7842
 func TestJetStreamJSAckSuffixCorruption(t *testing.T) {
 	const (

@@ -3719,11 +3719,8 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 				if streamFound {
 					// if consumer option is passed, verify that the consumer exists on stream
 					if opts.Consumer != _EMPTY_ {
-						for _, cons := range s.consumers {
-							if cons.name == opts.Consumer {
-								consumerFound = true
-								break
-							}
+						if s.lookupConsumer(opts.Consumer) != nil {
+							consumerFound = true
 						}
 					}
 					break
