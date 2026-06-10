@@ -2636,8 +2636,12 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 	if updatedFilters {
 		// Cleanup messages that lost interest.
 		if o.retention == InterestPolicy {
+			// Capture mset under the lock.
+			mset := o.mset
 			o.mu.Unlock()
-			o.cleanupNoInterestMessages(o.mset, false)
+			if mset != nil {
+				o.cleanupNoInterestMessages(mset, false)
+			}
 			o.mu.Lock()
 		}
 

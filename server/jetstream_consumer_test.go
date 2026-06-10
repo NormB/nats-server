@@ -12710,3 +12710,58 @@ func TestJetStreamConsumerStreamNumPendingClearedOnStepDown(t *testing.T) {
 		return nil
 	})
 }
+
+// Must be run with -race.
+func TestJetStreamConsumerUpdateConfigStopRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo.>"},
+		Retention: InterestPolicy,
+		Storage:   MemoryStorage,
+	})
+	require_NoError(t, err)
+
+	for range 400 {
+		o, err := mset.addConsumer(&ConsumerConfig{
+			Durable:       "C",
+			FilterSubject: "foo.a",
+			AckPolicy:     AckExplicit,
+		})
+		require_NoError(t, err)
+
+		// Update filter subject so cleanupNoInterestMessages runs.
+		newCfg := o.config()
+		newCfg.FilterSubject = "foo.b"
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		start := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			<-start
+			// On unfixed code this passes nil o.mset to cleanupNoInterestMessages
+			// and panics with a nil deref; recover so the test can report it.
+			defer func() { _ = recover() }()
+			_ = o.updateConfig(&newCfg)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			// Exactly mirrors stopWithFlags' write to the shared field under o.mu.
+			o.mu.Lock()
+			o.mset = nil
+			o.mu.Unlock()
+		}()
+		close(start)
+		wg.Wait()
+
+		// Restore so a full stop can tear the consumer down cleanly, then stop.
+		o.mu.Lock()
+		o.mset = mset
+		o.mu.Unlock()
+		_ = o.stop()
+	}
+}
