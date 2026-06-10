@@ -4586,10 +4586,11 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	if priorityGroup != nil {
 		if (priorityGroup.MinPending != 0 || priorityGroup.MinAckPending != 0) && o.cfg.PriorityPolicy != PriorityOverflow {
 			sendErr(400, "Bad Request - Not a Overflow Priority consumer")
+			return
 		}
-
 		if priorityGroup.Id != _EMPTY_ && o.cfg.PriorityPolicy != PriorityPinnedClient {
 			sendErr(400, "Bad Request - Not a Pinned Client Priority consumer")
+			return
 		}
 		if priorityGroup.Priority < 0 || priorityGroup.Priority > 9 {
 			sendErr(400, "Bad Request - Priority must be between 0 and 9")

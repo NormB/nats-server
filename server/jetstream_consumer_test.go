@@ -2631,6 +2631,84 @@ func TestJetStreamConsumerPriorityPullRequests(t *testing.T) {
 	}
 }
 
+func TestJetStreamConsumerInvalidPriorityGroupRequestNotServed(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo.>"},
+		Retention: LimitsPolicy,
+	})
+	require_NoError(t, err)
+
+	for range 10 {
+		_, err = js.Publish("foo.bar", []byte("hello"))
+		require_NoError(t, err)
+	}
+
+	for i, test := range []struct {
+		name          string
+		priorityGroup PriorityGroup
+		description   string
+	}{
+		{"overflow", PriorityGroup{MinPending: 1}, "Bad Request - Not a Overflow Priority consumer"},
+		{"pinned_request", PriorityGroup{Id: "PINNED-ID"}, "Bad Request - Not a Pinned Client Priority consumer"},
+		{"priority_outside_range", PriorityGroup{Priority: 10}, "Bad Request - Priority must be between 0 and 9"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// A plain pull consumer with NO priority policy (PriorityNone).
+			durable := fmt.Sprintf("C-%d", i)
+			_, err = mset.addConsumer(&ConsumerConfig{
+				Durable:       durable,
+				FilterSubject: "foo.>",
+				AckPolicy:     AckExplicit,
+			})
+			require_NoError(t, err)
+
+			req := JSApiConsumerGetNextRequest{
+				Batch:         1,
+				Expires:       2 * time.Second,
+				PriorityGroup: test.priorityGroup,
+			}
+			reqb, err := json.Marshal(req)
+			require_NoError(t, err)
+
+			inbox := nats.NewInbox()
+			sub, err := nc.SubscribeSync(inbox)
+			require_NoError(t, err)
+			defer sub.Unsubscribe()
+
+			require_NoError(t, nc.PublishRequest(fmt.Sprintf("$JS.API.CONSUMER.MSG.NEXT.TEST.%s", durable), inbox, reqb))
+
+			// First response must be the 400 rejection.
+			msg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, "400", msg.Header.Get("Status"))
+			require_Equal(t, test.description, msg.Header.Get("Description"))
+
+			// There must be NO second response. On the buggy code the request
+			// falls through, is added to o.waiting and served an actual
+			// stream message.
+			if extra, err := sub.NextMsg(750 * time.Millisecond); err == nil {
+				t.Fatalf("Expected exactly one response, got a second one: status=%q data=%q",
+					extra.Header.Get("Status"), string(extra.Data))
+			}
+
+			// The rejected request must not be queued as waiting.
+			o := mset.lookupConsumer(durable)
+			require_NotNil(t, o)
+			o.mu.RLock()
+			wlen := o.waiting.len()
+			o.mu.RUnlock()
+			require_Len(t, wlen, 0)
+		})
+	}
+}
+
 func TestJetStreamConsumerOverflow(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
