@@ -799,6 +799,7 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 		return nil
 	}
 	if mset == nil {
+		js.mu.RUnlock()
 		return errors.New("stream missing")
 	}
 	s, cc := js.srv, js.cluster

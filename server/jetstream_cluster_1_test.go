@@ -8366,6 +8366,30 @@ func TestJetStreamClusterConsumerHealthCheckSurfacesAssignmentErr(t *testing.T) 
 	require_NoError(t, sjs.isConsumerHealthy(mset, "CONSUMER", ca))
 }
 
+func TestJetStreamClusterConsumerHealthCheckStreamMissingNoLockLeak(t *testing.T) {
+	js := &jetStream{}
+	ca := &consumerAssignment{}
+	err := js.isConsumerHealthy(nil, "consumer", ca)
+	require_Error(t, err, errors.New("stream missing"))
+
+	// The JS lock must have been released. Attempt to acquire the write lock
+	// from a separate goroutine with a timeout so a leaked lock does not hang
+	// the test forever.
+	done := make(chan struct{})
+	go func() {
+		js.mu.Lock()
+		defer js.mu.Unlock()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Lock acquired, no leak.
+	case <-time.After(2 * time.Second):
+		t.Fatal("js.mu lock leaked: could not acquire write lock after isConsumerHealthy returned")
+	}
+}
+
 func TestJetStreamClusterStreamHealthCheckRecoversAfterSuccessfulUpdate(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
