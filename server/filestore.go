@@ -186,6 +186,7 @@ type fileStore struct {
 	syncTmr     *time.Timer
 	cfg         FileStreamInfo
 	fcfg        FileStoreConfig
+	syncAlways  atomic.Bool // Mirrors FileStoreConfig.SyncAlways for lock-free reads from writeFileWithOptionalSync.
 	prf         keyGen
 	oldprf      keyGen
 	aek         cipher.AEAD
@@ -440,6 +441,7 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		fsld:   make(chan struct{}),
 		srv:    fcfg.srv,
 	}
+	fs.syncAlways.Store(fcfg.SyncAlways)
 
 	// Register with access time service.
 	ats.Register()
@@ -759,7 +761,10 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 		if cfg.PersistMode == AsyncPersistMode {
 			supportsAsyncFlush = true
 			fs.fcfg.SyncAlways = false
+			fs.syncAlways.Store(false)
+			lmb.mu.Lock()
 			lmb.syncAlways = false
+			lmb.mu.Unlock()
 		}
 
 		if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
@@ -13763,7 +13768,7 @@ func (alg StoreCompression) Decompress(buf []byte) ([]byte, error) {
 // sets O_SYNC on the open file if SyncAlways is set. The dios semaphore is
 // handled automatically by this function, so don't wrap calls to it in dios.
 func (fs *fileStore) writeFileWithOptionalSync(name string, data []byte, perm fs.FileMode) error {
-	return writeAtomically(name, data, perm, fs.fcfg.SyncAlways)
+	return writeAtomically(name, data, perm, fs.syncAlways.Load())
 }
 
 func writeFileWithSync(name string, data []byte, perm fs.FileMode) error {

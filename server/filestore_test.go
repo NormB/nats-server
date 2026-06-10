@@ -14482,3 +14482,59 @@ func TestFileStoreMultiLastSeqsDoesNotReorderConfigSubjects(t *testing.T) {
 	require_Equal(t, fs.cfg.Subjects[0], "orders.*")
 	require_Equal(t, fs.cfg.Subjects[1], "billing.*")
 }
+
+// Must be run with -race.
+func TestFileStoreUpdateConfigSyncAlwaysRace(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir()}
+	cfg := StreamConfig{
+		Name:        "zzz",
+		Storage:     FileStorage,
+		Subjects:    []string{"foo"},
+		Replicas:    3,
+		PersistMode: AsyncPersistMode,
+	}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Make sure we have a last message block established.
+	_, _, err = fs.StoreMsg("foo", nil, []byte("hello"), 0)
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader side: continuously create pending writes and flush them, which
+	// reads lmb.syncAlways under mb.mu inside flushPendingMsgsLocked.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _, _ = fs.StoreMsg("foo", nil, []byte("data"), 0)
+			fs.mu.RLock()
+			lmb := fs.lmb
+			fs.mu.RUnlock()
+			if lmb != nil {
+				_ = lmb.flushPendingMsgs()
+			}
+		}
+	}()
+
+	// Writer side: UpdateConfig writes lmb.syncAlways without holding lmb.mu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 3000 {
+			ncfg := cfg
+			_ = fs.UpdateConfig(&ncfg)
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
+}
