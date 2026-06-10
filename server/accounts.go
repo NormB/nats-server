@@ -1468,19 +1468,19 @@ func (a *Account) sendBackendErrorTrackingLatency(si *serviceImport, reason rsiR
 // TODO(dlc) - holding locks for RTTs may be too much long term. Should revisit.
 func (a *Account) sendTrackingLatency(si *serviceImport, responder *client) bool {
 	a.mu.RLock()
-	rc := si.rc
+	rc, share, siTs := si.rc, si.share, si.ts
 	a.mu.RUnlock()
 	if rc == nil {
 		return true
 	}
 
 	ts := time.Now()
-	serviceRTT := time.Duration(ts.UnixNano() - si.ts)
-	requestor := si.rc
+	serviceRTT := time.Duration(ts.UnixNano() - siTs)
+	requestor := rc
 
 	sl := &ServiceLatency{
 		Status:    200,
-		Requestor: requestor.getClientInfo(si.share),
+		Requestor: requestor.getClientInfo(share),
 		Responder: responder.getClientInfo(true),
 	}
 	var respRTT, reqRTT time.Duration
@@ -1490,7 +1490,7 @@ func (a *Account) sendTrackingLatency(si *serviceImport, responder *client) bool
 	if sl.Requestor != nil {
 		reqRTT = sl.Requestor.RTT
 	}
-	sl.RequestStart = time.Unix(0, si.ts-int64(reqRTT)).UTC()
+	sl.RequestStart = time.Unix(0, siTs-int64(reqRTT)).UTC()
 	sl.ServiceLatency = serviceRTT - respRTT
 	sl.TotalLatency = reqRTT + serviceRTT
 	if respRTT > 0 {

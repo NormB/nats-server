@@ -4326,3 +4326,46 @@ func TestAccountRemoveCbJSWriteRace(t *testing.T) {
 		<-done
 	}
 }
+
+// Must be run with -race.
+func TestAccountSendTrackingLatencyRcRace(t *testing.T) {
+	a := NewAccount("A")
+	rc := &client{kind: CLIENT}
+	responder := &client{kind: SYSTEM}
+
+	si := &serviceImport{
+		acc:      a,
+		rc:       rc,
+		share:    false,
+		ts:       time.Now().UnixNano(),
+		tracking: true,
+		latency:  &serviceLatency{subject: "latency.subj"},
+	}
+
+	const iters = 1000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader goroutine: exercises the unlocked re-read of si.rc.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			a.sendTrackingLatency(si, responder)
+			a.mu.Lock()
+			si.m1 = nil
+			a.mu.Unlock()
+		}
+	}()
+
+	// Writer goroutine: mimics sendLatencyResult writing si.rc under a.mu.Lock.
+	go func() {
+		defer wg.Done()
+		for range iters {
+			a.mu.Lock()
+			si.rc = rc
+			a.mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+}
