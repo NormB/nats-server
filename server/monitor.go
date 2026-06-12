@@ -468,7 +468,7 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 	}
 	// Closed Clients
 	var needCopy bool
-	if subs || auth {
+	if subs || subsDet || auth {
 		needCopy = true
 	}
 	for _, cc := range closedClients {

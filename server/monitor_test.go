@@ -7035,3 +7035,45 @@ func TestMonitorConnzAccountRace(t *testing.T) {
 	c.acc = accA
 	c.mu.Unlock()
 }
+
+func TestConnzClosedSubsDetailNoSharedMutation(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// Inject a closed client with subscription detail directly into the ring buffer.
+	cc := &closedClient{}
+	cc.Cid = 1
+	cc.subs = []SubDetail{{Subject: "foo.bar"}}
+	cc.NumSubs = 1
+	s.mu.Lock()
+	s.closed.append(cc)
+	s.mu.Unlock()
+
+	// Concurrently request closed connections with subscription detail.
+	var wg sync.WaitGroup
+	opts := &ConnzOptions{State: ConnClosed, SubscriptionsDetail: true}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Connz(opts); err != nil {
+				t.Errorf("Error on Connz: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The shared cached object must not have been mutated.
+	s.mu.Lock()
+	leaked := cc.SubsDetail != nil
+	s.mu.Unlock()
+	require_False(t, leaked)
+
+	// A plain closed-conn query must not carry SubsDetail.
+	c, err := s.Connz(&ConnzOptions{State: ConnClosed})
+	require_NoError(t, err)
+	require_Len(t, len(c.Conns), 1)
+	if c.Conns[0].SubsDetail != nil {
+		t.Fatalf("Plain closed-conn query unexpectedly carried SubsDetail: %+v", c.Conns[0].SubsDetail)
+	}
+}
