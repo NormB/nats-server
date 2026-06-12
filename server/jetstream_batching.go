@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"path/filepath"
@@ -131,6 +132,18 @@ type batchStagedDiff struct {
 type batchExpectedPerSubject struct {
 	sseq  uint64 // Stream sequence.
 	clseq uint64 // Clustered proposal sequence.
+}
+
+// copyCounterSources returns a deep copy of the given counter sources.
+func copyCounterSources(src CounterSources) CounterSources {
+	if src == nil {
+		return nil
+	}
+	dst := make(CounterSources, len(src))
+	for stream, subjects := range src {
+		dst[stream] = maps.Clone(subjects)
+	}
+	return dst
 }
 
 func (diff *batchStagedDiff) commit(mset *stream) {
@@ -341,9 +354,9 @@ func checkMsgHeadersPreClusteredProposal(
 			initial = *counter.total
 			sources = counter.sources
 		} else if counter, ok = mset.clusteredCounterTotal[subject]; ok {
-			initial = *counter.total
-			sources = counter.sources
 			// Make an explicit copy to separate the staged data from what's committed.
+			initial.Set(counter.total)
+			sources = copyCounterSources(counter.sources)
 			// Don't need to initialize all values, they'll be overwritten later.
 			counter = &msgCounterRunningTotal{ops: counter.ops}
 		} else {
