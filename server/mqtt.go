@@ -4131,7 +4131,11 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 
 	// The message payload will be the total packet length minus
 	// what we have consumed for the variable header
-	pp.sz = pl - (r.pos - start)
+	payloadSize := pl - (r.pos - start)
+	if payloadSize < 0 {
+		return fmt.Errorf("invalid remaining length %d for PUBLISH packet", pl)
+	}
+	pp.sz = payloadSize
 	if pp.sz > 0 {
 		start = r.pos
 		r.pos += pp.sz

@@ -1934,6 +1934,21 @@ func TestMQTTMalformedRemainingLengthCausesDisconnect(t *testing.T) {
 				return mc, []byte{mqttPacketPubComp, 3, 0, 1, 0}
 			},
 		},
+		{
+			name: "publish",
+			packet: func(t *testing.T) (net.Conn, []byte) {
+				mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+				testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+				// Declare a remaining length that only covers the topic length field,
+				// then write a much larger topic.
+				w := newMQTTWriter(0)
+				w.WriteByte(mqttPacketPub)
+				w.WriteVarInt(2)
+				w.WriteBytes(bytes.Repeat([]byte("a"), 64))
+				return mc, w.Bytes()
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c, packet := test.packet(t)
