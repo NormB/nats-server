@@ -2854,7 +2854,7 @@ VALID:
 		}
 		return seq, false, nil
 	}
-	o.resetLocalStartingSeq(seq)
+	recalcPending := o.resetLocalStartingSeq(seq)
 	if o.store != nil {
 		o.store.Reset(seq - 1)
 		// Cleanup messages that lost interest.
@@ -2868,19 +2868,23 @@ VALID:
 		}
 	}
 	// Recalculate pending, and re-trigger message delivery.
-	o.streamNumPending()
+	if recalcPending {
+		o.streamNumPending()
+	}
 	o.signalNewMessages()
 	return seq, true, nil
 }
 
 // Lock should be held.
-func (o *consumer) resetLocalStartingSeq(seq uint64) {
+func (o *consumer) resetLocalStartingSeq(seq uint64) bool {
+	recalcPending := o.sseq != seq || len(o.pending) > 0
 	o.pending, o.rdc = nil, nil
 	o.rdq = nil
 	o.rdqi.Empty()
 	o.sseq, o.dseq = seq, 1
 	o.adflr, o.asflr = o.dseq-1, o.sseq-1
 	o.ldt, o.lat = time.Time{}, time.Time{}
+	return recalcPending
 }
 
 func (o *consumer) loopAndForwardProposals(qch chan struct{}) {

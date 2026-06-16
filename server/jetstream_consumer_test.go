@@ -11325,6 +11325,12 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 2, adflr: 1,
 			sseq: 2, asflr: 1,
 		})
+		// Confirm the initial pending values.
+		o.mu.RLock()
+		npc, npf := o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 2)
+		require_Equal(t, npf, 0)
 
 		// Resetting the consumer with an empty request results in a reset back to the ack floor.
 		var resp JSApiConsumerResetResponse
@@ -11345,6 +11351,14 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 1, asflr: 1,
 		})
+		// Confirm pending was recalculated.
+		o.mu.Lock()
+		npc, npf = o.npc, o.npf
+		// Reset so we can check pending isn't recalculated if there's nothing to reset later.
+		o.npf = 0
+		o.mu.Unlock()
+		require_Equal(t, npc, 3)
+		require_Equal(t, npf, 4)
 
 		// Trying to reset to zero also resets back to the ack floor.
 		req := JSApiConsumerResetRequest{Seq: 0}
@@ -11367,6 +11381,12 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 1, asflr: 1,
 		})
+		// Confirm pending was not recalculated, since it was already accurate.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 3)
+		require_Equal(t, npf, 0)
 
 		// Resetting the consumer to the last message's sequence so it can be delivered still.
 		req = JSApiConsumerResetRequest{Seq: 4}
@@ -11390,6 +11410,12 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 3, asflr: 3,
 		})
+		// Confirm pending was recalculated.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 1)
+		require_Equal(t, npf, 4)
 
 		// As a result of moving the starting sequence up, some messages
 		// have now lost interest and need to be removed.
