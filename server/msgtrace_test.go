@@ -16,6 +16,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -6709,6 +6710,91 @@ func TestMsgTraceAccDestWithSamplingJWTUpdate(t *testing.T) {
 				// Otherwise, we should have no more (but let's be conservative)
 				// than the sampling number.
 				require_LessThan[int](t, n, int(float64(test.sampling*total/100)*1.35))
+			}
+		})
+	}
+}
+
+func TestMsgTraceLeafNodeRequiresPublishPermissionForTraceDest(t *testing.T) {
+	hubConf := createConfFile(t, []byte(`
+		port: -1
+		server_name: "HUB"
+		accounts {
+			A {
+				users: [
+					{ user: "a", password: "pwd" }
+					{
+						user: "leaf"
+						password: "pwd"
+						permissions: { publish: ["pub.ok", "trace.ok"], subscribe: [">"] }
+					}
+				]
+			}
+		}
+		leafnodes { port: -1 }
+	`))
+	hub, ohub := RunServerWithConfig(hubConf)
+	defer hub.Shutdown()
+
+	hlog := &captureErrorLogger{errCh: make(chan string, 16)}
+	hub.SetLogger(hlog, false, false)
+
+	// Inject over a raw leaf connection so the trace headers are evaluated on
+	// the hub's inbound leaf path directly (a client on a leaf server would be
+	// filtered there first, never reaching the hub-side leaf check we test).
+	leafConn, err := net.DialTimeout("tcp", net.JoinHostPort(ohub.LeafNode.Host, fmt.Sprintf("%d", ohub.LeafNode.Port)), 2*time.Second)
+	require_NoError(t, err)
+	defer leafConn.Close()
+	br := bufio.NewReader(leafConn)
+	_, err = br.ReadString('\n') // INFO
+	require_NoError(t, err)
+	// headers:true so the hub accepts our HMSG.
+	_, err = fmt.Fprintf(leafConn, "CONNECT {\"user\":\"leaf\",\"pass\":\"pwd\",\"headers\":true}\r\nPING\r\n")
+	require_NoError(t, err)
+	checkLeafNodeConnected(t, hub)
+
+	ncHub := natsConnect(t, hub.ClientURL(), nats.UserInfo("a", "pwd"))
+	defer ncHub.Close()
+
+	// Leaf publishes (allowed) to "pub.ok" but points the trace at "dest".
+	sendTraced := func(dest string) {
+		t.Helper()
+		hdr := "NATS/1.0\r\nNats-Trace-Dest: " + dest + "\r\nNats-Trace-Only: true\r\n\r\n"
+		full := hdr + "hello"
+		_, err := fmt.Fprintf(leafConn, "HMSG pub.ok %d %d\r\n%s\r\n", len(hdr), len(full), full)
+		require_NoError(t, err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		dest    string
+		allowed bool
+	}{
+		{"unauthorized trace dest is rejected", "secret.trace", false},
+		{"authorized trace dest is allowed", "trace.ok", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			traceSub := natsSubSync(t, ncHub, tc.dest)
+			natsFlush(t, ncHub)
+			sendTraced(tc.dest)
+
+			if tc.allowed {
+				// Same framing reaches an authorized dest, so the check is
+				// not blanket-blocking and the regression below is meaningful.
+				natsNexMsg(t, traceSub, 2*time.Second)
+				return
+			}
+			// The trace event must NOT leak to the unauthorized dest...
+			if tm, err := traceSub.NextMsg(250 * time.Millisecond); err == nil {
+				t.Fatalf("Trace event leaked to unauthorized dest: %q", tm.Data)
+			}
+			// ...and the rejection must be reported (not a silent suppression).
+			select {
+			case errMsg := <-hlog.errCh:
+				require_Contains(t, errMsg, "Publish Violation")
+				require_Contains(t, errMsg, tc.dest)
+			case <-time.After(2 * time.Second):
+				t.Fatal("Did not get expected publish violation log for the trace dest")
 			}
 		})
 	}

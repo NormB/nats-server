@@ -529,7 +529,13 @@ func (c *client) allowedToPublishOnMsgTraceDest(s *Server, acc *Account, dest st
 	}
 	allowed := true
 	c.mu.Lock()
-	if c.perms != nil && (c.perms.pub.allow != nil || c.perms.pub.deny != nil) && !c.pubAllowedFullCheck(dest, false, true) {
+	if c.kind == LEAF {
+		if c.isSpokeLeafNode() {
+			allowed = c.leafReceiveAllowed(td)
+		} else {
+			allowed = c.leafSendAllowed(td)
+		}
+	} else if c.perms != nil && (c.perms.pub.allow != nil || c.perms.pub.deny != nil) && !c.pubAllowedFullCheck(dest, false, true) {
 		allowed = false
 	}
 	c.mu.Unlock()
