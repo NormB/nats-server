@@ -2545,7 +2545,8 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		// TODO: (levb: not sure why since one can subscribe to `#` and it'll
 		// include everything; I guess this would discourage? Otherwise another
 		// candidate for DO NOT DELIVER prefix list).
-		if strings.HasPrefix(f.filter, mqttSubPrefix) {
+		if strings.HasPrefix(f.filter, mqttSubPrefix) ||
+			strings.HasPrefix(f.filter, mqttPubRelDeliverySubjectPrefix) {
 			f.qos = mqttSubAckFailure
 			continue
 		}

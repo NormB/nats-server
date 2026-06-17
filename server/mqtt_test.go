@@ -5042,6 +5042,12 @@ func TestMQTTPermissionsViolation(t *testing.T) {
 	// unless explicitly granted by allow permissions.
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "$MQTT/msgs/#", qos: 1}}, []byte{mqttSubAckFailure})
 
+	// MQTT clients should not be able to subscribe to the internal
+	// "$MQTT.deliver.pubrel.*" subjects either. Unlike "$MQTT.msgs.*",
+	// canSubscribe bypasses the allow-list for this prefix (so internal
+	// subscriptions work), so processSubs is the only guard that rejects it.
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: strings.ReplaceAll(mqttPubRelDeliverySubjectPrefix, ".", "/") + "+", qos: 1}}, []byte{mqttSubAckFailure})
+
 	onc := natsConnect(t, s.ClientURL(), nats.UserInfo("observer", "pass"))
 	defer onc.Close()
 	osub := natsSubSync(t, onc, "$MQTT.msgs.>")
