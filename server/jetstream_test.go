@@ -105,6 +105,43 @@ func RunJetStreamServerOnPort(port int, sd string) *Server {
 	return RunServer(&opts)
 }
 
+func TestJetStreamRemoteUsageUpdateLengthOverflow(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	// Make sure the account has an active jsAccount.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "T", Subjects: []string{"t"}})
+	require_NoError(t, err)
+
+	acc := s.globalAccount()
+	jsa := s.getJetStream().lookupAccount(acc)
+	require_NotNil(t, jsa)
+
+	subject := fmt.Sprintf(jsaUpdatesPubT, acc.Name, "NODE1")
+	// MaxUint64 in little-endian is simply eight 0xFF bytes.
+	maxLen := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+
+	// Case 1: overflow in the multi-tier guard. length lives at msg[minUsageUpdateLen+4:].
+	multi := make([]byte, usageMultiTiersLen)
+	copy(multi[minUsageUpdateLen+4:], maxLen) // length = MaxUint64
+	jsa.remoteUpdateUsage(nil, nil, nil, subject, _EMPTY_, multi)
+
+	// Case 2: overflow in the excess-record loop guard. A clean multi-tier header
+	// (length 0) consumes exactly usageMultiTiersLen bytes, then one excess record
+	// whose length field (at msg[16:]) is MaxUint64.
+	excess := make([]byte, usageMultiTiersLen+usageRecordLen)
+	excess[minUsageUpdateLen] = 1                // excessRecordCnt = 1 (uint32 LE)
+	copy(excess[usageMultiTiersLen+16:], maxLen) // excess record length = MaxUint64
+	jsa.remoteUpdateUsage(nil, nil, nil, subject, _EMPTY_, excess)
+
+	// Reaching here without a panic means the bounds checks held. Confirm the
+	// server is still responsive.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "T2", Subjects: []string{"t2"}})
+	require_NoError(t, err)
+}
+
 func clientConnectToServer(t *testing.T, s *Server) *nats.Conn {
 	t.Helper()
 	nc, err := nats.Connect(s.ClientURL(),
