@@ -6673,40 +6673,6 @@ func TestServerHealthz(t *testing.T) {
 
 // When we converted ipq to use generics we still were using sync.Map. Currently you can not convert
 // any or any to a generic parameterized type. So this stopped working and panics.
-// Copyright 2013-2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-// Make sure that we do not run the http server for monitoring unless asked.
-// https://github.com/nats-io/nats-server/issues/2170
-// Just the ever increasing subs part.
-// Helper to map to connection name
-// getConnsIdleDurations returns a slice of parsed idle durations from a connection info slice.
-// sortedDurationsDesc checks if a time.Duration slice is sorted in descending order.
-// getIdleDurations returns a slice of idle durations from a connection info list up until now time.
-// sortedDurationsAsc checks if a time.Duration slice is sorted in ascending order.
-// Tests handle root
-// Make sure options for ConnInfo like subs=1, authuser, etc do not cause a race.
-// Make sure a bad client that is disconnected right away has proper values.
-// Make sure a bad client that tries to connect plain to TLS has proper values.
-// Create a connection to test ConnInfo
-// Benchmark our Connz generation. Don't use HTTP here, just measure server endpoint.
-// Helper function to check that a JS cluster is formed
-// https://github.com/nats-io/nats-server/issues/4144
-// expectHealthStatus makes a request to the URL and checks the
-// HTTP status code, Content-Type header and health status string.
-// checkHealthStatus checks the health status from a JSON response.
-// checkHealthzEndpoint makes requests to the /healthz endpoint and checks the health status.
-// When we converted ipq to use generics we still were using sync.Map. Currently you can not convert
-// any or any to a generic parameterized type. So this stopped working and panics.
 func TestMonitorIpqzWithGenerics(t *testing.T) {
 	opts := DefaultMonitorOptions()
 	opts.JetStream = true
