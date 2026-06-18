@@ -105,6 +105,43 @@ func RunJetStreamServerOnPort(port int, sd string) *Server {
 	return RunServer(&opts)
 }
 
+func TestJetStreamRemoteUsageUpdateLengthOverflow(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	// Make sure the account has an active jsAccount.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "T", Subjects: []string{"t"}})
+	require_NoError(t, err)
+
+	acc := s.globalAccount()
+	jsa := s.getJetStream().lookupAccount(acc)
+	require_NotNil(t, jsa)
+
+	subject := fmt.Sprintf(jsaUpdatesPubT, acc.Name, "NODE1")
+	// MaxUint64 in little-endian is simply eight 0xFF bytes.
+	maxLen := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+
+	// Case 1: overflow in the multi-tier guard. length lives at msg[minUsageUpdateLen+4:].
+	multi := make([]byte, usageMultiTiersLen)
+	copy(multi[minUsageUpdateLen+4:], maxLen) // length = MaxUint64
+	jsa.remoteUpdateUsage(nil, nil, nil, subject, _EMPTY_, multi)
+
+	// Case 2: overflow in the excess-record loop guard. A clean multi-tier header
+	// (length 0) consumes exactly usageMultiTiersLen bytes, then one excess record
+	// whose length field (at msg[16:]) is MaxUint64.
+	excess := make([]byte, usageMultiTiersLen+usageRecordLen)
+	excess[minUsageUpdateLen] = 1                // excessRecordCnt = 1 (uint32 LE)
+	copy(excess[usageMultiTiersLen+16:], maxLen) // excess record length = MaxUint64
+	jsa.remoteUpdateUsage(nil, nil, nil, subject, _EMPTY_, excess)
+
+	// Reaching here without a panic means the bounds checks held. Confirm the
+	// server is still responsive.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "T2", Subjects: []string{"t2"}})
+	require_NoError(t, err)
+}
+
 func clientConnectToServer(t *testing.T, s *Server) *nats.Conn {
 	t.Helper()
 	nc, err := nats.Connect(s.ClientURL(),
@@ -22644,6 +22681,22 @@ func TestJetStreamScheduledMessageParse(t *testing.T) {
 		// A schedule can only run at least once every second.
 		_, _, ok = parseMsgSchedule("@every 999ms", nil, 0)
 		require_False(t, ok)
+
+		// The next fire time anchors on the previous fire time rounded to the
+		// nearest second, plus the interval.
+		const interval = 1500 * time.Millisecond
+		anchor := time.Now().UTC().Add(time.Second)
+		sts, repeat, ok = parseMsgSchedule("@every 1500ms", nil, anchor.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, sts.UnixNano(), anchor.Round(time.Second).Add(interval).UnixNano())
+
+		// Re-arming from that fire time rounds again before adding the interval.
+		prev := sts
+		sts, repeat, ok = parseMsgSchedule("@every 1500ms", nil, sts.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, sts.UnixNano(), prev.Round(time.Second).Add(interval).UnixNano())
 	})
 
 	// <cron> pattern
@@ -24210,6 +24263,78 @@ func TestJetStreamMirrorRetriesOnSeqAlreadySeenMismatch(t *testing.T) {
 	}
 }
 
+// Must be run with -race.
+func TestJetStreamHealthzConsumerCheckConcurrentMapRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	acc := s.globalAccount()
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	opts := &HealthzOptions{
+		Account:  acc.Name,
+		Stream:   "TEST",
+		Consumer: "MISSING",
+		Details:  true,
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: repeatedly create and delete consumers in the stream's map,
+	// holding mset.mu just like setConsumer/removeConsumer.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			name := fmt.Sprintf("C-%d", i)
+			i++
+			mset.mu.Lock()
+			mset.consumers[name] = &consumer{name: name}
+			mset.mu.Unlock()
+			mset.mu.Lock()
+			delete(mset.consumers, name)
+			mset.mu.Unlock()
+		}
+	}()
+
+	// Reader: hammer healthz which (on unfixed code) ranges mset.consumers
+	// without any lock.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = s.healthz(opts)
+		}
+	}()
+
+	// Let the goroutines race for a bounded amount of time.
+	time.Sleep(2 * time.Second)
+	close(stop)
+	wg.Wait()
+}
+
 // https://github.com/nats-io/nats-server/issues/7842
 func TestJetStreamJSAckSuffixCorruption(t *testing.T) {
 	const (
@@ -24290,4 +24415,128 @@ func TestJetStreamJSAckSuffixCorruption(t *testing.T) {
 	receiver := dummyRouteClient()
 	receiver.route = &route{}
 	require_NoError(t, receiver.parse(frame))
+}
+
+// Must be run with -race.
+func TestJetStreamStreamConfigSourcesDataRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader: continuously copy the whole config (reads Sources slice header)
+	// under mset.cfgMu.RLock.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			cfg := mset.config()
+			_ = len(cfg.Sources)
+		}
+	}()
+
+	// Writer: drive updates that add a brand new Source each iteration, which
+	// hits the `mset.cfg.Sources = append(...)` mutation under mset.mu only.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(stop)
+		for i := range 200 {
+			cfg := mset.config()
+			cfg.Sources = append(cfg.Sources, &StreamSource{Name: fmt.Sprintf("SRC_%d", i)})
+			if err := mset.updateWithAdvisory(&cfg, false, false); err != nil {
+				// Don't fail the test on update errors (sources point at
+				// non-existent streams); we only care about the mutation race.
+				return
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(stop)
+		t.Fatal("timeout")
+	}
+}
+
+// Must be run with -race.
+func TestJetStreamStreamSubjectsOverlapDataRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	acc := s.globalAccount()
+	jsa := acc.js
+	require_NotNil(t, jsa)
+
+	// Stream A: the "other" stream whose cfg.Subjects gets concurrently
+	// updated while subjectsOverlap reads it.
+	msetA, err := acc.addStream(&StreamConfig{Name: "A", Subjects: []string{"a.>"}})
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: drive concurrent writes of msetA.cfg under cfgMu, exactly as
+	// updateConfig does (mset.cfg = *cfg under cfgMu).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ncfg := msetA.config()
+			ncfg.Subjects = []string{fmt.Sprintf("a.%d.>", i)}
+			// Mirror updateConfig's write: under mset.mu and mset.cfgMu.
+			msetA.mu.Lock()
+			msetA.cfgMu.Lock()
+			msetA.cfg = ncfg
+			msetA.cfgMu.Unlock()
+			msetA.mu.Unlock()
+		}
+	}()
+
+	// Reader: call the real subjectsOverlap under jsa.mu, which reads
+	// msetA.cfg.Subjects. self is nil so A is inspected.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			jsa.mu.RLock()
+			jsa.subjectsOverlap([]string{"b.>"}, nil)
+			jsa.mu.RUnlock()
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }

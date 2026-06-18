@@ -5976,6 +5976,84 @@ func TestJetStreamClusterConsumerDefaultsFromStream(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterConsumerLimitsUpdateGatedAtMetaLeader(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := &StreamConfig{
+		Name:     "test",
+		Subjects: []string{"test.*"},
+		Storage:  MemoryStorage,
+		Replicas: 3,
+		ConsumerLimits: StreamConsumerLimits{
+			MaxAckPending:     20,
+			InactiveThreshold: 10 * time.Second,
+		},
+	}
+	_, err := jsStreamCreate(t, nc, cfg)
+	require_NoError(t, err)
+
+	// Consumer sits right at the current stream limit.
+	_, err = js.AddConsumer("test", &nats.ConsumerConfig{
+		Name:          "consumer",
+		AckPolicy:     nats.AckExplicitPolicy,
+		MaxAckPending: 20,
+	})
+	require_NoError(t, err)
+
+	// Reads the consumer limits the meta leader currently has assigned.
+	metaLeaderLimits := func() StreamConsumerLimits {
+		t.Helper()
+		var limits StreamConsumerLimits
+		checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+			ml := c.leader()
+			if ml == nil {
+				return errors.New("no meta leader")
+			}
+			sjs := ml.getJetStream()
+			sjs.mu.RLock()
+			sa := sjs.streamAssignment(globalAccountName, "test")
+			if sa == nil || sa.Config == nil {
+				sjs.mu.RUnlock()
+				return errors.New("no stream assignment")
+			}
+			limits = sa.Config.ConsumerLimits
+			sjs.mu.RUnlock()
+			return nil
+		})
+		return limits
+	}
+
+	// Sanity: the meta leader has the original limits assigned.
+	require_Equal(t, metaLeaderLimits().MaxAckPending, 20)
+
+	// Lowering MaxAckPending below the existing consumer must be rejected.
+	badCfg := *cfg
+	badCfg.ConsumerLimits.MaxAckPending = 10
+	_, err = jsStreamUpdate(t, nc, &badCfg)
+	require_Error(t, err, NewJSStreamUpdateError(fmt.Errorf("change to limits violates consumers: consumer")))
+
+	// And crucially, the meta leader must not have committed the rejected config:
+	// the assignment should still carry the original limit, not the rejected one.
+	require_Equal(t, metaLeaderLimits().MaxAckPending, 20)
+
+	// A valid update (raise the limit) should still succeed.
+	goodCfg := *cfg
+	goodCfg.ConsumerLimits.MaxAckPending = 30
+	_, err = jsStreamUpdate(t, nc, &goodCfg)
+	require_NoError(t, err)
+	require_Equal(t, metaLeaderLimits().MaxAckPending, 30)
+
+	// Clearing a limit to zero (unlimited) must not be treated as a violation.
+	clearCfg := *cfg
+	clearCfg.ConsumerLimits.MaxAckPending = 0
+	_, err = jsStreamUpdate(t, nc, &clearCfg)
+	require_NoError(t, err)
+}
+
 // Discovered that we are not properly setting certain default filestore blkSizes.
 func TestJetStreamClusterCheckFileStoreBlkSizes(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
@@ -6884,6 +6962,38 @@ func TestJetStreamClusterProcessSnapshotPanicAfterStreamDelete(t *testing.T) {
 	require_True(t, sa != nil)
 	require_True(t, node == nil)
 	require_Error(t, mset.processSnapshot(&StreamReplicatedState{}, 0), errCatchupStreamStopped)
+}
+
+func TestJetStreamClusterProcessSnapshotWhenLimitsExceeded(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Force this server to believe it has exceeded its storage limits.
+	sjs := sl.getJetStream()
+	atomic.StoreInt64(&sjs.storeMax, -1)
+	require_True(t, sjs.limitsExceeded(FileStorage))
+
+	// The snapshot should bail with insufficient resources. As otherwise
+	// the snapshot would be incorrectly marked successful.
+	snap := StreamReplicatedState{FirstSeq: 1, LastSeq: 100}
+	err = mset.processSnapshot(&snap, 100)
+	require_Error(t, err, NewJSInsufficientResourcesError())
+	require_False(t, isClusterResetErr(err))
+	require_False(t, isOutOfSpaceErr(err))
 }
 
 func TestJetStreamClusterDiscardNewPerSubjectRejectsWithoutCLFSBump(t *testing.T) {
@@ -8197,6 +8307,10 @@ func TestJetStreamClusterStreamUpdateMaxConsumersLimit(t *testing.T) {
 				c.restartAll()
 				c.waitOnLeader()
 				c.waitOnStreamLeader(globalAccountName, "TEST")
+				c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER_1")
+				if !remove {
+					c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER_2")
+				}
 			}
 		}
 
@@ -10507,6 +10621,18 @@ func TestJetStreamClusterConsumerSelectStartingSeqDeferred(t *testing.T) {
 	})
 }
 
+type failProposeRaftNode struct {
+	RaftNode
+}
+
+func (n *failProposeRaftNode) Propose([]byte) error {
+	return errNotLeader
+}
+
+func (n *failProposeRaftNode) ProposeMulti([]*Entry) error {
+	return errNotLeader
+}
+
 func TestJetStreamClusterProposeFailureDoesNotDriftClseq(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -10535,16 +10661,23 @@ func TestJetStreamClusterProposeFailureDoesNotDriftClseq(t *testing.T) {
 	sl := c.streamLeader(globalAccountName, "TEST")
 	mset, err := sl.globalAccount().lookupStream("TEST")
 	require_NoError(t, err)
-	rn := mset.raftNode().(*raft)
 
-	// forceProposeFailure quickly switches the underlying Raft state, so any
-	// node.Propose / node.ProposeMulti call inside fn returns errNotLeader.
+	// forceProposeFailure changes node.Propose / node.ProposeMulti to always
+	// return errNotLeader.
 	// We deliberately do NOT touch n.leaderState, the upper layer still sees
 	// the node as leader, reproducing the race window.
 	forceProposeFailure := func(fn func() error) error {
-		prevState := rn.state.Swap(int32(Follower))
+		mset.mu.Lock()
+		prevNode := mset.node
+		mset.node = &failProposeRaftNode{RaftNode: prevNode}
+		mset.mu.Unlock()
+
 		err = fn()
-		rn.state.Store(prevState)
+
+		mset.mu.Lock()
+		mset.node = prevNode
+		mset.mu.Unlock()
+
 		return err
 	}
 
@@ -10594,9 +10727,7 @@ func TestJetStreamClusterProposeFailureDoesNotDriftClseq(t *testing.T) {
 	for _, s := range c.servers {
 		mset, err = s.globalAccount().lookupStream("TEST")
 		require_NoError(t, err)
-		rn = mset.raftNode().(*raft)
-		require_NotNil(t, rn)
-		require_False(t, rn.IsDeleted())
+		require_False(t, mset.raftNode().IsDeleted())
 	}
 }
 

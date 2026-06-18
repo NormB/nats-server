@@ -5432,6 +5432,30 @@ func TestConfigReloadRoutePoolAndPerAccount(t *testing.T) {
 	// Now add accounts "B" and "D" and do a config reload.
 	reloadUpdateConfig(t, srva, confA, fmt.Sprintf(confATemplate, "pool_size: 3", "accounts: [\"A\",\"B\",\"D\"]"))
 
+	// reloadClusterPoolAndAccounts must not let srva's Reload() return until the
+	// remotes have confirmed they processed the per-account route additions.
+	for _, s := range []*Server{srvb, srvc} {
+		for _, acc := range []string{"B", "D"} {
+			s.mu.RLock()
+			_, hasRoute := s.accRoutes[acc]
+			a, found := s.accounts.Load(acc)
+			s.mu.RUnlock()
+			if !hasRoute {
+				t.Fatalf("%s.Reload() returned before remote %s set up the per-account route for %q; the route confirmation wait was skipped", srva, s, acc)
+			}
+			if !found {
+				t.Fatalf("Remote %s does not know account %q", s, acc)
+			}
+			acc := a.(*Account)
+			acc.mu.RLock()
+			rpi := acc.routePoolIdx
+			acc.mu.RUnlock()
+			if rpi != accTransitioningToDedicatedRoute {
+				t.Fatalf("%s.Reload() returned before remote %s marked account %q transitioning (routePoolIdx=%d); the route confirmation wait was skipped", srva, s, acc.Name, rpi)
+			}
+		}
+	}
+
 	// Even before reloading srvb and srvc, we should already have per-account
 	// routes for accounts B and D being established. The accounts routePoolIdx
 	// should be marked as transitioning.
@@ -7258,6 +7282,77 @@ func TestConfigReloadAddRemoveRemoteLeafNodes(t *testing.T) {
 	reloadUpdateConfig(t, s2, conf2, fmt.Sprintf(tmpl2, _EMPTY_, _EMPTY_, _EMPTY_))
 	checkLeafNodeConnectedCount(t, s2, 0)
 	checkLeafs(nil)
+}
+
+func TestConfigReloadAddRemoveRemoteLeafNodesVarz(t *testing.T) {
+	conf1 := createConfFile(t, []byte(`
+		port: -1
+		server_name: "A"
+		leafnodes {
+			port: -1
+		}
+	`))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	tmpl2 := `
+		port: -1
+		http: -1
+		server_name: "B"
+		accounts {
+			A: {users:[{user: "A", password: "pwd"}]}
+			B: {users:[{user: "B", password: "pwd"}]}
+		}
+		leafnodes {
+			remotes [
+				%s
+				%s
+			]
+		}
+	`
+	remoteTmpl := fmt.Sprintf(`{ url: "nats://127.0.0.1:%d"`, o1.LeafNode.Port) + ", account=%q}"
+	accA := fmt.Sprintf(remoteTmpl, "A")
+	accB := fmt.Sprintf(remoteTmpl, "B")
+	conf2 := createConfFile(t, fmt.Appendf(nil, tmpl2, accA, _EMPTY_))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkLeafNodeConnectedCount(t, s2, 1)
+
+	checkRemotes := func(accs ...string) {
+		t.Helper()
+		// Check both the HTTP endpoint (mode 0), which caches the Varz
+		// object, and the programmatic API (mode 1).
+		url := fmt.Sprintf("http://127.0.0.1:%d/varz", s2.MonitorAddr().Port)
+		for mode := 0; mode < 2; mode++ {
+			v := pollVarz(t, s2, mode, url, nil)
+			require_Len(t, len(v.LeafNode.Remotes), len(accs))
+			for _, acc := range accs {
+				var ok bool
+				for _, r := range v.LeafNode.Remotes {
+					if r.LocalAccount == acc {
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					t.Fatalf("Mode %d: did not find account %q in varz remotes: %+v", mode, acc, v.LeafNode.Remotes)
+				}
+			}
+		}
+	}
+	// This will also populate the cached s.varz used by the HTTP endpoint.
+	checkRemotes("A")
+
+	// Add a remote with local account "B".
+	reloadUpdateConfig(t, s2, conf2, fmt.Sprintf(tmpl2, accA, accB))
+	checkLeafNodeConnectedCount(t, s2, 2)
+	checkRemotes("A", "B")
+
+	// Remove the remote with local account "A".
+	reloadUpdateConfig(t, s2, conf2, fmt.Sprintf(tmpl2, _EMPTY_, accB))
+	checkLeafNodeConnectedCount(t, s2, 1)
+	checkRemotes("B")
 }
 
 func TestConfigReloadRemoteLeafNodeNkeyChange(t *testing.T) {

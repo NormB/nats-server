@@ -120,7 +120,7 @@ func testMQTTReadPacket(t testing.TB, r *mqttReader) (byte, int) {
 			t.Fatalf("Error reading packet: %v", err)
 		}
 		var complete bool
-		pl, complete, err = r.readPacketLen()
+		pl, complete, err = r.readPacketLen(MAX_PAYLOAD_SIZE)
 		if err != nil {
 			t.Fatalf("Error reading packet: %v", err)
 		}
@@ -196,7 +196,7 @@ func TestMQTTReader(t *testing.T) {
 	}
 
 	r.reset([]byte{0x82, 0xff, 0x3})
-	l, _, err := r.readPacketLenWithCheck(false)
+	l, _, err := r.readVarInt()
 	if err != nil {
 		t.Fatal("error getting packet len")
 	}
@@ -204,7 +204,7 @@ func TestMQTTReader(t *testing.T) {
 		t.Fatalf("expected length 0xff82 got 0x%x", l)
 	}
 	r.reset([]byte{0xff, 0xff, 0xff, 0xff, 0xff})
-	if _, _, err := r.readPacketLenWithCheck(false); err == nil || !strings.Contains(err.Error(), "malformed") {
+	if _, _, err := r.readVarInt(); err == nil || !strings.Contains(err.Error(), "malformed") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -219,7 +219,7 @@ func TestMQTTReader(t *testing.T) {
 		if pt := b & mqttPacketMask; pt != mqttPacketPub {
 			t.Fatalf("Unexpected byte: %v", b)
 		}
-		pl, complete, err := r.readPacketLen()
+		pl, complete, err := r.readPacketLen(MAX_PAYLOAD_SIZE)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -298,11 +298,57 @@ func TestMQTTWriter(t *testing.T) {
 
 	r.reset(w.Bytes())
 	for _, v := range ints {
-		x, _, _ := r.readPacketLenWithCheck(false)
+		x, _, _ := r.readVarInt()
 		if v != x {
 			t.Fatalf("expected %d, got %d", v, x)
 		}
 	}
+}
+
+func TestMQTTIncompleteConnectMaxPayloadViolationDisconnects(t *testing.T) {
+	const maxPayload = 1024
+	const remainingLength = maxPayload + 1
+
+	o := testMQTTDefaultOptions()
+	o.MaxPayload = maxPayload
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, err := net.Dial("tcp", net.JoinHostPort(o.MQTT.Host, fmt.Sprintf("%d", o.MQTT.Port)))
+	require_NoError(t, err)
+	defer c.Close()
+
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketConnect)
+	w.WriteVarInt(remainingLength)
+	w.Write(bytes.Repeat([]byte{'A'}, maxPayload))
+
+	_, err = testMQTTWrite(c, w.Bytes())
+	require_NoError(t, err)
+
+	testMQTTExpectDisconnect(t, c)
+}
+
+func TestMQTTPacketLenMaxPayloadViolation(t *testing.T) {
+	const maxPayload = 1024
+
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketConnect)
+	w.WriteVarInt(maxPayload)
+	w.Write(bytes.Repeat([]byte{'A'}, maxPayload))
+
+	r := &mqttReader{}
+	r.reset(w.Bytes())
+	r.pstart = r.pos
+
+	_, err := r.readByte("packet type")
+	require_NoError(t, err)
+
+	packetLen, complete, err := r.readPacketLen(maxPayload)
+	require_Error(t, err, ErrMaxPayload)
+	require_False(t, complete)
+	require_Equal(t, packetLen, w.Len())
+	require_Equal(t, len(r.pbuf), 0)
 }
 
 func testMQTTDefaultOptions() *Options {
@@ -1886,6 +1932,21 @@ func TestMQTTMalformedRemainingLengthCausesDisconnect(t *testing.T) {
 				mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 				testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 				return mc, []byte{mqttPacketPubComp, 3, 0, 1, 0}
+			},
+		},
+		{
+			name: "publish",
+			packet: func(t *testing.T) (net.Conn, []byte) {
+				mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+				testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+				// Declare a remaining length that only covers the topic length field,
+				// then write a much larger topic.
+				w := newMQTTWriter(0)
+				w.WriteByte(mqttPacketPub)
+				w.WriteVarInt(2)
+				w.WriteBytes(bytes.Repeat([]byte("a"), 64))
+				return mc, w.Bytes()
 			},
 		},
 	} {
@@ -4982,6 +5043,12 @@ func TestMQTTPermissionsViolation(t *testing.T) {
 	// unless explicitly granted by allow permissions.
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "$MQTT/msgs/#", qos: 1}}, []byte{mqttSubAckFailure})
 
+	// MQTT clients should not be able to subscribe to the internal
+	// "$MQTT.deliver.pubrel.*" subjects either. Unlike "$MQTT.msgs.*",
+	// canSubscribe bypasses the allow-list for this prefix (so internal
+	// subscriptions work), so processSubs is the only guard that rejects it.
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: strings.ReplaceAll(mqttPubRelDeliverySubjectPrefix, ".", "/") + "+", qos: 1}}, []byte{mqttSubAckFailure})
+
 	onc := natsConnect(t, s.ClientURL(), nats.UserInfo("observer", "pass"))
 	defer onc.Close()
 	osub := natsSubSync(t, onc, "$MQTT.msgs.>")
@@ -5023,6 +5090,93 @@ func TestMQTTPermissionsViolation(t *testing.T) {
 	// we deny permission to subscribe on "$MQTT.sub.>", so the server won't be
 	// able to create the internal NATS subscription for the JS consumer.
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/baz", qos: 1}}, []byte{mqttSubAckFailure})
+}
+
+func TestMQTTSubscribeDenyRetainedAndQoSReplay(t *testing.T) {
+	// A subscriber can be allowed to subscribe to a broad wildcard while being
+	// denied delivery of more specific subjects. Normal live delivery applies
+	// the deny filter (deliverMsg -> checkDenySub), but retained-message
+	// serialization and QoS1+ durable replay must apply it too.
+	o := testMQTTDefaultOptions()
+	o.Users = []*User{
+		{
+			Username: "pub",
+			Password: "pass",
+			Permissions: &Permissions{
+				Publish:   &SubjectPermission{Allow: []string{"secret.>", "foo.>"}},
+				Subscribe: &SubjectPermission{Allow: []string{"_INBOX.>"}},
+			},
+		},
+		{
+			Username: "sub",
+			Password: "pass",
+			Permissions: &Permissions{
+				Subscribe: &SubjectPermission{Allow: []string{">"}, Deny: []string{"secret.>"}},
+			},
+		},
+	}
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	pub := &mqttConnInfo{clientID: "pub", user: "pub", pass: "pass", cleanSess: true}
+	mp, rp := testMQTTConnect(t, pub, o.MQTT.Host, o.MQTT.Port)
+	defer mp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// 1) Live delivery: the denied subject must not be delivered, but an allowed
+	// subject on the same broad wildcard subscription must.
+	subLive := &mqttConnInfo{clientID: "sub-live", user: "sub", pass: "pass", cleanSess: true}
+	mc, rc := testMQTTConnect(t, subLive, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "#", qos: 0}}, []byte{0})
+	testMQTTPublish(t, mp, rp, 0, false, false, "secret/one", 0, []byte("live-denied"))
+	testMQTTExpectNothing(t, rc)
+	testMQTTPublish(t, mp, rp, 0, false, false, "foo/live", 0, []byte("live-allowed"))
+	testMQTTCheckPubMsg(t, mc, rc, "foo/live", 0, []byte("live-allowed"))
+	testMQTTDisconnect(t, mc, nil)
+	mc.Close()
+
+	// 2) QoS1 durable replay: subscribe with a persistent session, disconnect,
+	// publish a denied and an allowed QoS1 message while offline, then reconnect.
+	// The denied subject must not be replayed; the allowed one must.
+	persist := &mqttConnInfo{clientID: "persist-sub", user: "sub", pass: "pass", cleanSess: false}
+	mc, rc = testMQTTConnect(t, persist, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "#", qos: 1}}, []byte{1})
+	testMQTTDisconnect(t, mc, nil)
+	mc.Close()
+
+	// secret.one is published first so that, without the deny check, it would be
+	// the first message replayed (i.e. the bypass would be observed here).
+	testMQTTPublish(t, mp, rp, 1, false, false, "secret/one", 1, []byte("qos1-denied"))
+	testMQTTPublish(t, mp, rp, 1, false, false, "foo/replay", 2, []byte("qos1-allowed"))
+
+	mc, rc = testMQTTConnect(t, persist, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, true)
+	// Only the allowed message is replayed; the denied one is filtered out (and
+	// acked so JetStream does not keep redelivering it) before delivery.
+	testMQTTCheckPubMsg(t, mc, rc, "foo/replay", mqttPubQos1, []byte("qos1-allowed"))
+	testMQTTExpectNothing(t, rc)
+	testMQTTDisconnect(t, mc, nil)
+	mc.Close()
+
+	// 3) Retained delivery: a retained denied subject must not be serialized to a
+	// new subscriber, but a retained allowed subject must.
+	testMQTTPublish(t, mp, rp, 0, false, true, "secret/one", 0, []byte("retained-denied"))
+	testMQTTPublish(t, mp, rp, 0, false, true, "foo/ret", 0, []byte("retained-allowed"))
+	testMQTTFlush(t, mp, nil, rp)
+
+	subRet := &mqttConnInfo{clientID: "sub-retained", user: "sub", pass: "pass", cleanSess: true}
+	mc, rc = testMQTTConnect(t, subRet, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "#", qos: 0}}, []byte{0})
+	// Only the allowed retained message is delivered (with the RETAIN flag set).
+	testMQTTCheckPubMsg(t, mc, rc, "foo/ret", mqttPubFlagRetain, []byte("retained-allowed"))
+	testMQTTExpectNothing(t, rc)
 }
 
 func TestMQTTCleanSession(t *testing.T) {
@@ -8331,6 +8485,25 @@ func TestMQTTMaxPayloadEnforced(t *testing.T) {
 	testMQTTSendPublishPacket(t, mc, 0, false, false, "foo", 0, oversized)
 
 	testMQTTExpectDisconnect(t, mc)
+}
+
+func TestMQTTMaxPayloadDoesNotCapPublishTopic(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		server_name: test_mqtt_max_payload_topic
+		port: -1
+		max_payload: 1024
+		mqtt { listen: "127.0.0.1:-1" }
+		jetstream: { domain: "TEST", max_mem_store: 8MB, max_file_store: 8MB, store_dir: "`+t.TempDir()+`" }
+	`))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{clientID: "cid", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSendPublishPacket(t, mc, 0, false, false, strings.Repeat("a", 1100), 0, nil)
+	testMQTTFlush(t, mc, nil, r)
 }
 
 func TestMQTTJSApiMapping(t *testing.T) {

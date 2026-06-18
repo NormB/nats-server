@@ -10935,6 +10935,40 @@ func TestFileStoreMessageScheduleEncodeDecode(t *testing.T) {
 	}
 }
 
+func TestFileStoreMessageScheduleDecodeRejectsMalformed(t *testing.T) {
+	// Build a valid header that claims a single schedule entry.
+	header := func(count uint64) []byte {
+		b := make([]byte, headerLen)
+		b[0] = 1                                    // Magic version
+		binary.LittleEndian.PutUint64(b[1:], count) // Entry count
+		binary.LittleEndian.PutUint64(b[9:], 0)     // High sequence stamp
+		return b
+	}
+
+	for _, test := range []struct {
+		title string
+		buf   []byte
+		err   error
+	}{
+		{title: "ShortHeader", buf: make([]byte, headerLen-1), err: io.ErrShortBuffer},
+		{title: "BadVersion", buf: func() []byte { b := header(0); b[0] = 2; return b }(), err: ErrMsgScheduleInvalidVersion},
+		// Claims one entry but the buffer ends right after the header.
+		{title: "TruncatedAtSubjLen", buf: header(1), err: io.ErrUnexpectedEOF},
+		// Claims one entry, has the subject length but the subject bytes are missing.
+		{title: "TruncatedSubj", buf: append(header(1), 5, 0), err: io.ErrUnexpectedEOF},
+		// Has the subject but the timestamp/seq varints are missing.
+		{title: "TruncatedVarints", buf: append(header(1), 3, 0, 'f', 'o', 'o'), err: io.ErrUnexpectedEOF},
+		// Has the subject and timestamp varint but the seq varint is missing.
+		{title: "TruncatedSeq", buf: append(append(header(1), 3, 0, 'f', 'o', 'o'), binary.AppendVarint(nil, 12345)...), err: io.ErrUnexpectedEOF},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			ms := newMsgScheduling(func() {})
+			_, err := ms.decode(test.buf)
+			require_Error(t, err, test.err)
+		})
+	}
+}
+
 func TestFileStoreCorruptedNonOrderedSequences(t *testing.T) {
 	for _, test := range []struct {
 		title   string
@@ -11177,7 +11211,9 @@ func TestFileStoreEraseMsgDoesNotLoseTombstonesInEmptyBlock(t *testing.T) {
 		require_Error(t, err, ErrStoreMsgNotFound)
 
 		// The message should be erased.
+		mb.mu.Lock()
 		buf, err := mb.loadBlock(nil)
+		mb.mu.Unlock()
 		require_NoError(t, err)
 		require_False(t, bytes.Contains(buf, secret))
 
@@ -12486,6 +12522,73 @@ func TestFileStoreCompactFullyResetsFirstAndLastSeq(t *testing.T) {
 		mb.mu.Unlock()
 		require_NoError(t, err)
 		checkMbState(1, 0, 0)
+	})
+}
+
+func TestFileStoreCompactHeadReclaimRecompressedBlock(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		fcfg.BlockSize = 8 * 1024 * 1024 // Large so everything lands in one block.
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"zzz"}, Storage: FileStorage}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Use incompressible (random) payloads so the on-disk rbytes stays above
+		// compactMinimum (2MB) even after S2 compression.
+		const num = 50
+		msgs := make([][]byte, num)
+		for i := range num {
+			m := make([]byte, 64*1024)
+			_, err = crand.Read(m)
+			require_NoError(t, err)
+			msgs[i] = m
+			_, _, err = fs.StoreMsg("zzz", nil, m, 0)
+			require_NoError(t, err)
+		}
+
+		// Force the active block to be recompressed on disk so that smb.cmp
+		// matches the configured algorithm, emulating the post-rotation state
+		// that triggers the head-reclaim path. For a NoCompression store this is
+		// a no-op and smb.cmp stays NoCompression.
+		fs.mu.RLock()
+		smb := fs.lmb
+		fs.mu.RUnlock()
+		smb.mu.Lock()
+		require_NoError(t, smb.recompressOnDiskIfNeeded())
+		cmp := smb.cmp
+		rbytes := smb.rbytes
+		smb.mu.Unlock()
+		require_Equal(t, cmp, fcfg.Compression)
+		require_True(t, rbytes > compactMinimum)
+
+		// Compact away most of the block, leaving the tail. This drives the
+		// head-space reclaim branch which rewrites the block on disk.
+		_, err = fs.Compact(num - 5)
+		require_NoError(t, err)
+
+		// Sanity check we can still read the remaining messages in-process.
+		var smv StoreMsg
+		for seq := uint64(num - 5); seq <= num; seq++ {
+			sm, err := fs.LoadMsg(seq, &smv)
+			require_NoError(t, err)
+			require_True(t, bytes.Equal(sm.msg, msgs[seq-1]))
+		}
+
+		// Now reload from disk: this exercises decompressIfNeeded, which is where
+		// a missing CompressionInfo header would surface as a corrupt block.
+		require_NoError(t, fs.Stop())
+		fs, err = newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		var state StreamState
+		fs.FastState(&state)
+		require_Equal(t, state.Msgs, 6)
+		for seq := uint64(num - 5); seq <= num; seq++ {
+			sm, err := fs.LoadMsg(seq, &smv)
+			require_NoError(t, err)
+			require_True(t, bytes.Equal(sm.msg, msgs[seq-1]))
+		}
 	})
 }
 
@@ -14357,4 +14460,262 @@ loop:
 		t.Fatalf("SubjectForSeq returned a corrupted subject %d time(s); seq=%d got=%q want=%q",
 			n, gotSeqVal.Load(), corrupt, subjects[gotSeqVal.Load()-1])
 	}
+}
+
+func TestFileStoreMultiLastSeqsDoesNotReorderConfigSubjects(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "zzz", Subjects: []string{"orders.*", "billing.*"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	_, _, err = fs.StoreMsg("orders.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+	_, _, err = fs.StoreMsg("billing.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+
+	// Filter count == subject count drives the filterIsAll path.
+	_, err = fs.MultiLastSeqs([]string{"orders.*", "billing.*"}, 0, 0)
+	require_NoError(t, err)
+
+	// The advertised config subjects must keep their original order.
+	require_Equal(t, fs.cfg.Subjects[0], "orders.*")
+	require_Equal(t, fs.cfg.Subjects[1], "billing.*")
+}
+
+// Must be run with -race.
+func TestFileStoreUpdateConfigSyncAlwaysRace(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir()}
+	cfg := StreamConfig{
+		Name:        "zzz",
+		Storage:     FileStorage,
+		Subjects:    []string{"foo"},
+		Replicas:    3,
+		PersistMode: AsyncPersistMode,
+	}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Make sure we have a last message block established.
+	_, _, err = fs.StoreMsg("foo", nil, []byte("hello"), 0)
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader side: continuously create pending writes and flush them, which
+	// reads lmb.syncAlways under mb.mu inside flushPendingMsgsLocked.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _, _ = fs.StoreMsg("foo", nil, []byte("data"), 0)
+			fs.mu.RLock()
+			lmb := fs.lmb
+			fs.mu.RUnlock()
+			if lmb != nil {
+				_ = lmb.flushPendingMsgs()
+			}
+		}
+	}()
+
+	// Writer side: UpdateConfig writes lmb.syncAlways without holding lmb.mu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 3000 {
+			ncfg := cfg
+			_ = fs.UpdateConfig(&ncfg)
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
+}
+
+// Must be run with -race.
+func TestFileStoreStoreRawMsgTTLsRace(t *testing.T) {
+	sd := t.TempDir()
+	fs, err := newFileStore(
+		// Large block size so all messages stay in a single block (== lmb),
+		// guaranteeing the storeRawMsg increments and the indexCacheBuf rewrite
+		// target the same message block.
+		FileStoreConfig{StoreDir: sd, BlockSize: 8 * 1024 * 1024, CacheExpire: time.Millisecond},
+		StreamConfig{Name: "zzz", Subjects: []string{"test"}, Storage: FileStorage, AllowMsgTTL: true},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Large TTL so messages don't actually expire/remove during the test.
+	ttl := int64(3600)
+	hdr := fmt.Appendf(nil, "NATS/1.0\r\n%s: %d\r\n\r\n", JSMessageTTL, ttl)
+
+	// Store an initial message so seq 1 exists and lives in the lmb.
+	_, _, err = fs.StoreMsg("test", hdr, []byte("hello"), ttl)
+	require_NoError(t, err)
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+
+	// Writers: store TTL messages into the lmb, each bumps fs.lmb.ttls++ under fs.mu only.
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				if _, _, err := fs.StoreMsg("test", hdr, []byte("hello"), ttl); err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	// Readers: force the lmb cache to drop and reload, which reindexes and rewrites
+	// mb.ttls/mb.schedules under mb.mu only.
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				fs.mu.RLock()
+				lmb := fs.lmb
+				fseq := atomic.LoadUint64(&lmb.first.seq)
+				fs.mu.RUnlock()
+				// Flush pending to disk then drop the cache so the next load
+				// re-reads the block and reindexes it.
+				lmb.mu.Lock()
+				lmb.flushPendingMsgsLocked()
+				lmb.clearCacheAndOffset()
+				lmb.mu.Unlock()
+				// Load a seq that lives in the lmb; triggers loadMsgsWithLock and
+				// indexCacheBuf, which rewrites mb.ttls/mb.schedules under mb.mu.
+				fs.LoadMsg(fseq, nil)
+			}
+		}()
+	}
+
+	time.Sleep(2 * time.Second)
+	stop.Store(true)
+	wg.Wait()
+}
+
+// Must be run with -race.
+func TestFileStoreSyncDeletedDmapAliasRace(t *testing.T) {
+	fcfg := FileStoreConfig{
+		StoreDir:  t.TempDir(),
+		BlockSize: 1024, // small on purpose to create many blocks
+	}
+	fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Store enough messages across many blocks.
+	subj := "foo"
+	msg := bytes.Repeat([]byte("Z"), 50)
+	const total = 600
+	for range total {
+		_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+	}
+
+	// Create interior deletes so mb.dmap is non-empty in many blocks.
+	for seq := uint64(2); seq <= total-1; seq += 3 {
+		_, err = fs.RemoveMsg(seq)
+		require_NoError(t, err)
+	}
+
+	// Compact each non-last block so the removed records are physically dropped
+	// from disk, leaving real holes. This way a later reload via indexCacheBuf
+	// must reconstruct the holes with mb.dmap.Insert (the racy writer).
+	fs.mu.RLock()
+	cblks := append([]*msgBlock(nil), fs.blks...)
+	fs.mu.RUnlock()
+	for _, mb := range cblks[:len(cblks)-1] {
+		mb.mu.Lock()
+		err = mb.compact()
+		mb.mu.Unlock()
+		require_NoError(t, err)
+	}
+
+	// Snapshot the delete blocks to feed back into SyncDeleted.
+	fs.mu.Lock()
+	fs.readLockAllMsgBlocks()
+	live := fs.deleteBlocks()
+	dbs := make(DeleteBlocks, len(live))
+	for i, db := range live {
+		switch d := db.(type) {
+		case *avl.SequenceSet:
+			dbs[i] = d.Clone()
+		case *DeleteRange:
+			cp := *d
+			dbs[i] = &cp
+		default:
+			dbs[i] = db
+		}
+	}
+	fs.readUnlockAllMsgBlocks()
+	fs.mu.Unlock()
+	require_True(t, len(dbs) > 0)
+
+	// Grab a snapshot of the blocks so the loader goroutine can force cache expiry.
+	fs.mu.RLock()
+	blks := append([]*msgBlock(nil), fs.blks...)
+	fs.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Several reader goroutines continuously SyncDeleted, which traverses live
+	// mb.dmap via pruneDeleteBlock without holding mb.mu.
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = fs.SyncDeleted(dbs)
+			}
+		}()
+	}
+
+	// Several writer goroutines reload blocks, driving indexCacheBuf to Insert
+	// into mb.dmap under mb.mu only. A lock-free dmap traversal in SyncDeleted
+	// should trigger the race without a fix.
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, mb := range blks {
+					mb.mu.Lock()
+					mb.tryForceExpireCacheLocked()
+					_ = mb.loadMsgsWithLock()
+					mb.mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// Run briefly; the race detector should trip quickly.
+	time.Sleep(2 * time.Second)
+	close(stop)
+	wg.Wait()
+
+	// Sanity: store still usable.
+	_ = fs.State()
 }

@@ -1371,6 +1371,48 @@ func TestMemStoreMessageSchedule(t *testing.T) {
 	require_Equal(t, bytesToString(getHeader(JSScheduleNext, im.hdr)), JSScheduleNextPurge)
 }
 
+func TestMemStoreMessageScheduleEverySubSecondPrecision(t *testing.T) {
+	fs, err := newMemStore(
+		&StreamConfig{
+			Name: "TEST", Subjects: []string{"foo.*"}, Storage: MemoryStorage,
+			AllowMsgSchedules: true,
+		},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Capture message schedule proposals.
+	ch := make(chan *inMsg, 1)
+	fs.pmsgcb = func(im *inMsg) {
+		ch <- im
+	}
+
+	// Store a repeating message schedule with a sub-second remainder.
+	hdr := genHeader(nil, JSSchedulePattern, "@every 1500ms")
+	hdr = genHeader(hdr, JSScheduleTarget, "foo.target")
+	_, ts, err := fs.StoreMsg("foo.schedule", hdr, nil, 0)
+	require_NoError(t, err)
+
+	// We should have published a scheduled message.
+	im := require_ChanRead(t, ch, time.Second*3)
+	require_Equal(t, im.subj, "foo.target")
+	require_Equal(t, bytesToString(getHeader(JSScheduler, im.hdr)), "foo.schedule")
+
+	// The re-arm header is written with RFC3339Nano so the sub-second component
+	// of the next fire time survives the round trip through the header. Each
+	// fire time anchors on the previous one rounded to the nearest second, plus
+	// the interval: the first fire is round(store time) + 1500ms, and the
+	// re-arm rounds that again (up, .5s rounds away from zero) before adding
+	// another 1500ms.
+	const interval = 1500 * time.Millisecond
+	first := time.Unix(0, ts).UTC().Round(time.Second).Add(interval)
+	expected := first.Round(time.Second).Add(interval)
+	scheduleNext := bytesToString(getHeader(JSScheduleNext, im.hdr))
+	next, err := time.Parse(time.RFC3339Nano, scheduleNext)
+	require_NoError(t, err)
+	require_Equal(t, next.UnixNano(), expected.UnixNano())
+}
+
 func TestMemStoreNextWildcardMatch(t *testing.T) {
 	cfg := &StreamConfig{
 		Name:     "zzz",
@@ -1727,4 +1769,23 @@ func Benchmark_MemStoreLoadNextMsgFiltered(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestMemStoreMultiLastSeqsDoesNotReorderConfigSubjects(t *testing.T) {
+	subjects := []string{"orders.*", "billing.*"}
+	ms, err := newMemStore(&StreamConfig{Name: "zzz", Storage: MemoryStorage, Subjects: subjects})
+	require_NoError(t, err)
+
+	_, _, err = ms.StoreMsg("orders.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+	_, _, err = ms.StoreMsg("billing.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+
+	// Filter count == subject count drives the filterIsAll path.
+	_, err = ms.MultiLastSeqs([]string{"orders.*", "billing.*"}, 0, 0)
+	require_NoError(t, err)
+
+	// The advertised config subjects must keep their original order.
+	require_Equal(t, ms.cfg.Subjects[0], "orders.*")
+	require_Equal(t, ms.cfg.Subjects[1], "billing.*")
 }

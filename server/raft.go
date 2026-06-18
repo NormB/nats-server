@@ -1471,6 +1471,9 @@ type checkpoint struct {
 func (c *checkpoint) LoadLastSnapshot() ([]byte, error) {
 	c.n.Lock()
 	defer c.n.Unlock()
+	if c.n.State() == Closed {
+		return nil, errNodeClosed
+	}
 	if !c.n.snapshotting {
 		// The checkpoint can be aborted at any time, don't continue if that happened.
 		return nil, errSnapAborted
@@ -1491,6 +1494,11 @@ func (c *checkpoint) AppendEntriesSeq() iter.Seq2[*appendEntry, error] {
 	return func(yield func(*appendEntry, error) bool) {
 		for index := c.papplied + 1; index <= c.applied; index++ {
 			c.n.Lock()
+			if c.n.State() == Closed {
+				c.n.Unlock()
+				yield(nil, errNodeClosed)
+				return
+			}
 			if !c.n.snapshotting {
 				c.n.Unlock()
 				// The checkpoint can be aborted at any time, don't continue if that happened.
@@ -1519,13 +1527,17 @@ func (c *checkpoint) Abort() {
 
 // InstallSnapshot allows asynchronous installation of a snapshot by unlocking when
 // performing operations that don't strictly need to be locked. When the lock is re-acquired
-// n.snapshotting will be checked to ensure we're still meant to.
+// it's checked that the node is not closed and n.snapshotting is still set to ensure we're
+// still meant to install the snapshot.
 // Async snapshots can only be used when using CreateSnapshotCheckpoint.
 // Lock should be held.
 func (c *checkpoint) InstallSnapshot(data []byte) (uint64, error) {
 	n := c.n
 	n.Lock()
 	defer n.Unlock()
+	if n.State() == Closed {
+		return 0, errNodeClosed
+	}
 	if !n.snapshotting {
 		// The checkpoint can be aborted at any time, don't continue if that happened.
 		return 0, errSnapAborted
@@ -1549,21 +1561,24 @@ func (c *checkpoint) InstallSnapshot(data []byte) (uint64, error) {
 	n.Unlock()
 	err := writeFileWithSync(c.snapFile, encoded, defaultFilePerms)
 	n.Lock()
-	// On either failure path, drop the file we just wrote so it doesn't get
+	// On any failure path, drop the file we just wrote so it doesn't get
 	// picked up by setupLastSnapshot on restart. Skip the remove if it's the
 	// snapshot already adopted into n.snapfile for this term/applied.
-	if err != nil {
+	if closed := n.State() == Closed; closed || !n.snapshotting || err != nil {
 		if c.snapFile != n.snapfile {
 			os.Remove(c.snapFile)
 		}
+		// If the node was closed/deleted while we were writing, the write error
+		// is just a consequence of that, report the close instead.
+		if closed {
+			return 0, errNodeClosed
+		} else if !n.snapshotting {
+			return 0, errSnapAborted
+		}
+
 		// We could set write err here, but if this is a temporary situation, too many open files etc.
 		// we want to retry and snapshots are not fatal.
 		return 0, err
-	} else if !n.snapshotting {
-		if c.snapFile != n.snapfile {
-			os.Remove(c.snapFile)
-		}
-		return 0, errSnapAborted
 	}
 
 	// Delete our previous snapshot file if it exists.
@@ -1577,12 +1592,14 @@ func (c *checkpoint) InstallSnapshot(data []byte) (uint64, error) {
 	n.Unlock()
 	_, err = n.wal.Compact(snap.lastIndex + 1)
 	n.Lock()
-	if err != nil {
-		n.setWriteErrLocked(err)
-		return 0, err
+	if n.State() == Closed {
+		return 0, errNodeClosed
 	} else if !n.snapshotting {
 		// The checkpoint can be aborted at any time, don't continue if that happened.
 		return 0, errSnapAborted
+	} else if err != nil {
+		n.setWriteErrLocked(err)
+		return 0, err
 	}
 
 	compacted := n.bytes
@@ -3315,9 +3332,12 @@ func (n *raft) runCatchup(ar *appendEntryResponse, indexUpdatesQ *ipQueue[uint64
 
 	defer func() {
 		n.Lock()
-		delete(n.progress, peer)
-		if len(n.progress) == 0 {
-			n.progress = nil
+		// Only remove our own progress entry.
+		if q, ok := n.progress[peer]; ok && q == indexUpdatesQ {
+			delete(n.progress, peer)
+			if len(n.progress) == 0 {
+				n.progress = nil
+			}
 		}
 		// Check if this is a new peer and if so go ahead and propose adding them.
 		_, exists := n.peers[peer]
@@ -3504,10 +3524,20 @@ func (n *raft) catchupFollower(ar *appendEntryResponse) {
 	n.progress[ar.peer] = indexUpdates
 	n.wg.Add(1)
 	n.Unlock()
-	n.s.startGoRoutine(func() {
+	started := n.s.startGoRoutine(func() {
 		defer n.wg.Done()
 		n.runCatchup(ar, indexUpdates)
 	})
+	if !started {
+		n.wg.Done()
+		n.Lock()
+		if n.progress != nil && n.progress[ar.peer] == indexUpdates {
+			delete(n.progress, ar.peer)
+		}
+		n.Unlock()
+		indexUpdates.unregister()
+		arPool.Put(ar)
+	}
 }
 
 func (n *raft) loadEntry(index uint64) (*appendEntry, error) {
@@ -3534,11 +3564,12 @@ func (n *raft) applyCommit(index uint64) error {
 		delete(n.acks, index)
 	}
 
+	if index <= n.papplied {
+		return nil
+	}
+
 	ae := n.pae[index]
 	if ae == nil {
-		if index < n.papplied {
-			return nil
-		}
 		var err error
 		if ae, err = n.loadEntry(index); err != nil {
 			if err != ErrStoreClosed && err != ErrStoreEOF {
@@ -4590,20 +4621,20 @@ func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
 		// are behind and have specified a reply subject, so let's try to catch them up.
 		// In this case ar.term was populated with the remote's pterm.
 		n.catchupFollower(ar)
-	} else if ar.term > n.term {
-		// The remote node didn't commit the append entry, it looks like
-		// they are on a newer term than we are. Step down.
-		// In this case ar.term was populated with the remote's term.
-		n.Lock()
-		n.term = ar.term
-		n.vote = noVote
-		n.writeTermVote()
-		n.warn("Detected another leader with higher term, will stepdown")
-		n.stepdownLocked(noLeader)
-		n.Unlock()
-		arPool.Put(ar)
 	} else {
-		// Ignore, but return back to pool.
+		n.Lock()
+		if ar.term > n.term {
+			// The remote node didn't commit the append entry, it looks like
+			// they are on a newer term than we are. Step down.
+			// In this case ar.term was populated with the remote's term.
+			n.term = ar.term
+			n.vote = noVote
+			n.writeTermVote()
+			n.warn("Detected another leader with higher term, will stepdown")
+			n.stepdownLocked(noLeader)
+		}
+		n.Unlock()
+		// Either way, return back to pool.
 		arPool.Put(ar)
 	}
 }
@@ -4611,6 +4642,10 @@ func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
 // handleAppendEntryResponse processes responses to append entries.
 func (n *raft) handleAppendEntryResponse(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
 	ar := decodeAppendEntryResponse(msg)
+	if ar == nil {
+		n.error("Received malformed append entry response")
+		return
+	}
 	ar.reply = reply
 	n.resp.push(ar)
 }
@@ -4771,7 +4806,7 @@ func decodePeerState(buf []byte) (*peerState, error) {
 	expectedPeers := int(le.Uint32(buf[4:]))
 	buf = buf[8:]
 	ri := 0
-	for i, n := 0, expectedPeers; i < n && ri < len(buf); i++ {
+	for i, n := 0, expectedPeers; i < n && ri+idLen <= len(buf); i++ {
 		ps.knownPeers = append(ps.knownPeers, string(buf[ri:ri+idLen]))
 		ri += idLen
 	}
@@ -4951,6 +4986,8 @@ func (n *raft) setWriteErrLocked(err error) {
 	}
 	n.error("Critical write error: %v", err)
 	n.werr = err
+	// Abort any inflight async snapshot checkpoint.
+	n.snapshotting = false
 	n.shutdown()
 	assert.Unreachable("Raft encountered write error", map[string]any{
 		"n.accName": n.accName,
@@ -4988,9 +5025,16 @@ func (n *raft) setWriteErr(err error) {
 	n.setWriteErrLocked(err)
 }
 
-// writeTermVote will record the largest term and who we voted for to stable storage.
+// writeTermVote will record the largest term and who we voted for to stable
+// storage. It returns the write error, if any, so that callers which need the
+// term/vote to be durable before acting on it (e.g. granting or requesting a
+// vote) can avoid doing so when the persist fails.
 // Lock should be held.
-func (n *raft) writeTermVote() {
+func (n *raft) writeTermVote() error {
+	if n.werr != nil {
+		return n.werr
+	}
+
 	var buf [termVoteLen]byte
 	var le = binary.LittleEndian
 	le.PutUint64(buf[0:], n.term)
@@ -4999,7 +5043,7 @@ func (n *raft) writeTermVote() {
 
 	// If the term and vote hasn't changed then don't rewrite to disk.
 	if bytes.Equal(n.wtv, b) {
-		return
+		return nil
 	}
 	// Stamp latest and write the term & vote file.
 	n.wtv = b
@@ -5008,7 +5052,9 @@ func (n *raft) writeTermVote() {
 		n.wtv = nil
 		n.setWriteErrLocked(err)
 		n.warn("Error writing term and vote file for %q: %v", n.group, err)
+		return err
 	}
+	return nil
 }
 
 // voteResponse is a response to a vote request.
@@ -5108,11 +5154,18 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 
 	// Other server's log needs to be equal or more up-to-date than ours.
 	if voteOk && (vr.lastTerm > n.pterm || vr.lastTerm == n.pterm && vr.lastIndex >= n.pindex) {
-		vresp.granted = true
+		// Persist our vote before granting it. Raft requires the vote to be durable before
+		// we respond, otherwise a restart could forget the vote and let us grant a second
+		// vote in the same term, which would break election safety.
 		n.term = vr.term
 		n.vote = vr.candidate
-		n.writeTermVote()
-		n.resetElectionTimeout()
+		if err := n.writeTermVote(); err != nil {
+			n.vote = noVote
+			n.warn("Not granting vote for %q, could not persist term and vote: %v", n.group, err)
+		} else {
+			vresp.granted = true
+			n.resetElectionTimeout()
+		}
 	} else if n.vote == noVote && n.State() != Candidate {
 		// We have a more up-to-date log, and haven't voted yet.
 		// Start campaigning earlier, but only if not candidate already, as that would short-circuit us.
@@ -5145,7 +5198,14 @@ func (n *raft) requestVote() {
 		return
 	}
 	n.vote = n.id
-	n.writeTermVote()
+	if err := n.writeTermVote(); err != nil {
+		// Make sure that our self-vote is persisted durably before campaigning, otherwise
+		// we could vote for someone else in the same term after a restart.
+		n.vote = noVote
+		n.Unlock()
+		n.warn("Not requesting votes for %q, could not persist term and vote: %v", n.group, err)
+		return
+	}
 	vr := voteRequest{n.term, n.pterm, n.pindex, n.id, _EMPTY_}
 	subj, reply := n.vsubj, n.vreply
 	n.Unlock()

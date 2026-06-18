@@ -186,6 +186,7 @@ type fileStore struct {
 	syncTmr     *time.Timer
 	cfg         FileStreamInfo
 	fcfg        FileStoreConfig
+	syncAlways  atomic.Bool // Mirrors FileStoreConfig.SyncAlways for lock-free reads from writeFileWithOptionalSync.
 	prf         keyGen
 	oldprf      keyGen
 	aek         cipher.AEAD
@@ -440,6 +441,7 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		fsld:   make(chan struct{}),
 		srv:    fcfg.srv,
 	}
+	fs.syncAlways.Store(fcfg.SyncAlways)
 
 	// Register with access time service.
 	ats.Register()
@@ -759,7 +761,10 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 		if cfg.PersistMode == AsyncPersistMode {
 			supportsAsyncFlush = true
 			fs.fcfg.SyncAlways = false
+			fs.syncAlways.Store(false)
+			lmb.mu.Lock()
 			lmb.syncAlways = false
+			lmb.mu.Unlock()
 		}
 
 		if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
@@ -2177,7 +2182,9 @@ func (fs *fileStore) recoverTTLState() error {
 		ttlseq, err = fs.ttls.Decode(buf)
 		if err != nil {
 			fs.warn("Error decoding TTL state: %s", err)
+			// Remove the file, and reset collected state (if any).
 			_ = os.Remove(fn)
+			fs.ttls = thw.NewHashWheel()
 		}
 	}
 
@@ -2262,7 +2269,9 @@ func (fs *fileStore) recoverMsgSchedulingState() error {
 		schedSeq, err = fs.scheduling.decode(buf)
 		if err != nil {
 			fs.warn("Error decoding message scheduling state: %s", err)
+			// Remove the file, and reset collected state (if any).
 			_ = os.Remove(fn)
+			fs.scheduling = newMsgScheduling(fs.runMsgScheduling)
 		}
 	}
 
@@ -3791,10 +3800,11 @@ func (fs *fileStore) filterIsAll(filters []string) bool {
 		return false
 	}
 	// Sort so we can compare.
+	subjects := copyStrings(fs.cfg.Subjects)
 	slices.Sort(filters)
-	slices.Sort(fs.cfg.Subjects)
+	slices.Sort(subjects)
 	for i, subj := range filters {
-		if !subjectIsSubsetMatch(fs.cfg.Subjects[i], subj) {
+		if !subjectIsSubsetMatch(subjects[i], subj) {
 			return false
 		}
 	}
@@ -5018,7 +5028,9 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 		}
 		// Need to count these regardless as we might want to enable TTLs
 		// later via UpdateConfig.
+		fs.lmb.mu.Lock()
 		fs.lmb.ttls++
+		fs.lmb.mu.Unlock()
 	}
 
 	// Check if we have and need the age expiration timer running.
@@ -5033,7 +5045,9 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 	if fs.scheduling != nil {
 		if schedule, apiErr := nextMessageSchedule(hdr, ts); apiErr == nil && !schedule.IsZero() {
 			fs.scheduling.add(seq, subj, schedule.UnixNano())
+			fs.lmb.mu.Lock()
 			fs.lmb.schedules++
+			fs.lmb.mu.Unlock()
 		} else if getMessageScheduler(hdr) == _EMPTY_ {
 			fs.scheduling.removeSubject(subj)
 		}
@@ -10457,8 +10471,24 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 			buf := smb.cache.buf[moff:]
 			// Don't reuse, copy to new recycled buf.
 			nbuf := getMsgBlockBuf(len(buf))
+			// Recycle our nbuf when we are done.
+			defer recycleMsgBlockBuf(nbuf)
 			nbuf = append(nbuf, buf...)
 			smb.closeFDsLockedNoCheck()
+			// Check for compression.
+			if smb.cmp != NoCompression && len(nbuf) > 0 {
+				originalSize := len(nbuf)
+				if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
+					smb.mu.Unlock()
+					fs.mu.Unlock()
+					return purged, err
+				}
+				meta := &CompressionInfo{
+					Algorithm:    smb.cmp,
+					OriginalSize: uint64(originalSize),
+				}
+				nbuf = append(meta.MarshalMetadata(), nbuf...)
+			}
 			// Check for encryption.
 			if smb.bek != nil && len(nbuf) > 0 {
 				// Recreate to reset counter.
@@ -10471,13 +10501,6 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 				// For future writes make sure to set smb.bek to keep counter correct.
 				smb.bek = bek
 				smb.bek.XORKeyStream(nbuf, nbuf)
-			}
-			// Recompress if necessary (smb.cmp contains the algorithm used when
-			// the block was loaded from disk, or defaults to NoCompression if not)
-			if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
-				smb.mu.Unlock()
-				fs.mu.Unlock()
-				return purged, err
 			}
 
 			// We will write to a new file and mv/rename it in case of failure.
@@ -12418,6 +12441,13 @@ func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) error {
 	lseq := fs.state.LastSeq
 	fs.readLockAllMsgBlocks()
 	mdbs := fs.deleteBlocks()
+	// We'll release the locks below, so need to copy the ones that are references
+	// which are only safe while the locks are still held.
+	for i, db := range mdbs {
+		if ss, ok := db.(*avl.SequenceSet); ok {
+			mdbs[i] = ss.Clone()
+		}
+	}
 	fs.readUnlockAllMsgBlocks()
 
 	for _, db := range dbs {
@@ -13749,7 +13779,7 @@ func (alg StoreCompression) Decompress(buf []byte) ([]byte, error) {
 // sets O_SYNC on the open file if SyncAlways is set. The dios semaphore is
 // handled automatically by this function, so don't wrap calls to it in dios.
 func (fs *fileStore) writeFileWithOptionalSync(name string, data []byte, perm fs.FileMode) error {
-	return writeAtomically(name, data, perm, fs.fcfg.SyncAlways)
+	return writeAtomically(name, data, perm, fs.syncAlways.Load())
 }
 
 func writeFileWithSync(name string, data []byte, perm fs.FileMode) error {

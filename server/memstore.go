@@ -685,9 +685,11 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 			if lastPerSubject {
 				tss, _ = ms.fss.Find(stringToBytes(sm.subj))
 			}
-			// If we are last per subject, make sure to only adjust if all messages are before our first.
-			if tss == nil || tss.Last < first {
+			if tss == nil {
 				adjust++
+			} else if tss.Last < first {
+				// If we are last per subject, make sure to only adjust if all messages are before our first.
+				adjust += tss.Msgs
 			}
 			if seen != nil {
 				seen[sm.subj] = true
@@ -816,10 +818,11 @@ func (ms *memStore) filterIsAll(filters []string) bool {
 		return false
 	}
 	// Sort so we can compare.
+	subjects := copyStrings(ms.cfg.Subjects)
 	slices.Sort(filters)
-	slices.Sort(ms.cfg.Subjects)
+	slices.Sort(subjects)
 	for i, subj := range filters {
-		if !subjectIsSubsetMatch(ms.cfg.Subjects[i], subj) {
+		if !subjectIsSubsetMatch(subjects[i], subj) {
 			return false
 		}
 	}
@@ -1037,9 +1040,11 @@ func (ms *memStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPerS
 			if lastPerSubject {
 				tss, _ = ms.fss.Find(stringToBytes(sm.subj))
 			}
-			// If we are last per subject, make sure to only adjust if all messages are before our first.
-			if tss == nil || tss.Last < first {
+			if tss == nil {
 				adjust++
+			} else if tss.Last < first {
+				// If we are last per subject, make sure to only adjust if all messages are before our first.
+				adjust += tss.Msgs
 			}
 			if seen != nil {
 				seen[sm.subj] = true
@@ -1579,6 +1584,10 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 			purged = ms.state.Msgs
 		}
 		ms.state.Msgs -= purged
+		if ms.state.Msgs == 0 {
+			ms.state.FirstSeq = ms.state.LastSeq + 1
+			ms.state.FirstTime = time.Time{}
+		}
 		if bytes > ms.state.Bytes {
 			bytes = ms.state.Bytes
 		}
