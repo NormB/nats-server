@@ -794,8 +794,15 @@ func (c *client) mqttParse(buf []byte) error {
 			break
 		}
 
-		pl, complete, err = r.readPacketLen()
+		maxLen := int32(jwt.NoLimit)
+		if !connected {
+			maxLen = atomic.LoadInt32(&c.mpay)
+		}
+		pl, complete, err = r.readPacketLen(maxLen)
 		if err != nil || !complete {
+			if err == ErrMaxPayload {
+				c.maxPayloadViolation(pl, maxLen)
+			}
 			break
 		}
 		if err = mqttCheckRemainingLength(pt, pl); err != nil {
@@ -2538,7 +2545,8 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		// TODO: (levb: not sure why since one can subscribe to `#` and it'll
 		// include everything; I guess this would discourage? Otherwise another
 		// candidate for DO NOT DELIVER prefix list).
-		if strings.HasPrefix(f.filter, mqttSubPrefix) {
+		if strings.HasPrefix(f.filter, mqttSubPrefix) ||
+			strings.HasPrefix(f.filter, mqttPubRelDeliverySubjectPrefix) {
 			f.qos = mqttSubAckFailure
 			continue
 		}
@@ -2698,6 +2706,13 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		if rm == nil {
 			// This should not happen since we pre-load messages into rms before
 			// calling serialize.
+			continue
+		}
+		// A broad wildcard subscription can overlap a subscribe deny clause.
+		c.mu.Lock()
+		denied := c.mperms != nil && c.checkDenySub(string(psub.subject))
+		c.mu.Unlock()
+		if denied {
 			continue
 		}
 		var pi uint16
@@ -4137,7 +4152,11 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 
 	// The message payload will be the total packet length minus
 	// what we have consumed for the variable header
-	pp.sz = pl - (r.pos - start)
+	payloadSize := pl - (r.pos - start)
+	if payloadSize < 0 {
+		return fmt.Errorf("invalid remaining length %d for PUBLISH packet", pl)
+	}
+	pp.sz = payloadSize
 	if pp.sz > 0 {
 		start = r.pos
 		r.pos += pp.sz
@@ -5062,6 +5081,16 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		return
 	}
 
+	// A broad wildcard subscription can overlap a subscribe deny clause.
+	cc.mu.Lock()
+	denied := cc.mperms != nil && cc.checkDenySub(strippedSubj)
+	cc.mu.Unlock()
+	if denied {
+		sess.mu.Unlock()
+		sess.jsa.sendAck(reply)
+		return
+	}
+
 	pi, dup := sess.trackPublish(sub.mqtt.jsDur, reply)
 	sess.mu.Unlock()
 
@@ -5848,11 +5877,27 @@ func (r *mqttReader) readByte(field string) (byte, error) {
 	return b, nil
 }
 
-func (r *mqttReader) readPacketLen() (int, bool, error) {
-	return r.readPacketLenWithCheck(true)
+func (r *mqttReader) readPacketLen(maxLen int32) (int, bool, error) {
+	v, complete, err := r.readVarInt()
+	if err != nil {
+		return 0, false, err
+	}
+	if complete {
+		packetEnd := r.pos + v
+		packetLen := packetEnd - r.pstart
+		if maxLen != jwt.NoLimit && int64(packetLen) > int64(maxLen) {
+			return packetLen, false, ErrMaxPayload
+		}
+		if packetEnd <= len(r.buf) {
+			return v, true, nil
+		}
+	}
+	r.pbuf = make([]byte, len(r.buf)-r.pstart)
+	copy(r.pbuf, r.buf[r.pstart:])
+	return 0, false, nil
 }
 
-func (r *mqttReader) readPacketLenWithCheck(check bool) (int, bool, error) {
+func (r *mqttReader) readVarInt() (int, bool, error) {
 	m := 1
 	v := 0
 	for {
@@ -5865,9 +5910,6 @@ func (r *mqttReader) readPacketLenWithCheck(check bool) (int, bool, error) {
 		}
 		v += int(b&0x7f) * m
 		if (b & 0x80) == 0 {
-			if check && r.pos+v > len(r.buf) {
-				break
-			}
 			return v, true, nil
 		}
 		m *= 0x80
@@ -5875,8 +5917,6 @@ func (r *mqttReader) readPacketLenWithCheck(check bool) (int, bool, error) {
 			return 0, false, errMQTTMalformedVarInt
 		}
 	}
-	r.pbuf = make([]byte, len(r.buf)-r.pstart)
-	copy(r.pbuf, r.buf[r.pstart:])
 	return 0, false, nil
 }
 

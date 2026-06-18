@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -186,7 +187,6 @@ func TestMonitorNoPort(t *testing.T) {
 
 var (
 	appJSONContent = "application/json"
-	appJSContent   = "application/javascript"
 	textPlain      = "text/plain; charset=utf-8"
 	textHTML       = "text/html; charset=utf-8"
 )
@@ -274,6 +274,63 @@ func TestMonitorVarzSubscriptionsResetProperly(t *testing.T) {
 	}
 }
 
+// Must be run with -race.
+func TestMonitorVarzReloadRace(t *testing.T) {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+
+	// Ensure s.varz is populated so the marshal path reads the shared object.
+	_, err := http.Get(url)
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader: hit /varz, which marshals s.varz under s.varzMu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				resp, err := http.Get(url)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}
+	}()
+
+	// Writer: reload, which mutates s.varz via updateVarzConfigReloadableFields.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if err := s.ReloadOptions(s.getOpts().Clone()); err != nil {
+					t.Errorf("Error on reload: %v", err)
+					return
+				}
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
 func TestMonitorHandleVarz(t *testing.T) {
 	s, _ := runMonitorJSServer(t, -1, -1, 0, 0)
 	defer s.Shutdown()
@@ -356,9 +413,6 @@ func TestMonitorHandleVarz(t *testing.T) {
 			t.Fatalf("Expected 1000 max_ha_assets got %q", v.JetStream.Limits.MaxHAAssets)
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"varz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func pollConnz(t *testing.T, s *Server, mode int, url string, opts *ConnzOptions) *Connz {
@@ -436,9 +490,6 @@ func TestMonitorConnz(t *testing.T) {
 		testConnz(mode)
 		checkClientsCount(t, s, 0)
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"connz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestMonitorConnzBadParams(t *testing.T) {
@@ -815,6 +866,34 @@ func TestMonitorConnzWithOffsetAndLimit(t *testing.T) {
 			t.Fatalf("Expected Total to be 2, got %v", c.Total)
 		}
 	}
+}
+
+func TestMonitorConnzOffsetOverflow(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// Need at least one open connection so we get past the empty-result early
+	// return and reach the pagination slicing.
+	cl := createClientConnSubscribeAndPublish(t, s)
+	defer cl.Close()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		// Offset = math.MaxInt64, Limit = 1 makes Offset+Limit overflow to math.MinInt64.
+		c := pollConnz(t, s, mode, url+fmt.Sprintf("connz?offset=%d&limit=1", math.MaxInt64),
+			&ConnzOptions{Offset: math.MaxInt64, Limit: 1})
+		if c.Conns == nil || len(c.Conns) != 0 {
+			t.Fatalf("Expected 0 connections in array, got %v\n", len(c.Conns))
+		}
+		if c.NumConns != 0 {
+			t.Fatalf("Expected NumConns to be 0, got %v", c.NumConns)
+		}
+	}
+
+	// Both Offset and Limit at the max also overflows the sum.
+	_, err := s.Connz(&ConnzOptions{Offset: math.MaxInt64, Limit: math.MaxInt64})
+	require_NoError(t, err)
 }
 
 func TestMonitorConnzDefaultSorted(t *testing.T) {
@@ -1519,9 +1598,6 @@ func TestMonitorConnzWithRoutes(t *testing.T) {
 			}
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"routez?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestMonitorRoutezWithBadParams(t *testing.T) {
@@ -1576,9 +1652,6 @@ func TestSubsz(t *testing.T) {
 			}
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"subsz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestSubszOperatorMode(t *testing.T) {
@@ -1684,6 +1757,37 @@ func TestMonitorSubszWithOffsetAndLimit(t *testing.T) {
 			t.Fatalf("Expected subscription details for 100 subs, got %d\n", len(sl.Subs))
 		}
 	}
+}
+
+func TestMonitorSubszOffsetOverflow(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	nc := createClientConnSubscribeAndPublish(t, s)
+	defer nc.Close()
+
+	_, err := nc.Subscribe("foo.*", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	_, err = nc.Subscribe("foo.bar", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	_, err = nc.Subscribe("foo.foo", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		// Offset = math.MaxInt64, Limit = 1 makes Offset+Limit overflow to math.MinInt64.
+		sl := pollSubsz(t, s, mode, url+fmt.Sprintf("subsz?subs=1&offset=%d&limit=1", math.MaxInt64),
+			&SubszOptions{Subscriptions: true, Offset: math.MaxInt64, Limit: 1})
+		if len(sl.Subs) != 0 {
+			t.Fatalf("Expected 0 subscription details, got %d", len(sl.Subs))
+		}
+	}
+
+	// Both Offset and Limit at the max also overflows the sum.
+	_, err = s.Subsz(&SubszOptions{Subscriptions: true, Offset: math.MaxInt64, Limit: math.MaxInt64})
+	require_NoError(t, err)
 }
 
 func TestMonitorSubszTestPubSubject(t *testing.T) {
@@ -5446,9 +5550,26 @@ func TestMonitorJsz(t *testing.T) {
 				if len(info.AccountDetails) != 1 {
 					t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
 				}
-				if slices.ContainsFunc(info.AccountDetails[0].Streams, func(stream StreamDetail) bool {
-					return len(stream.DirectConsumer) > 0
-				}) {
+				for _, stream := range info.AccountDetails[0].Streams {
+					if len(stream.DirectConsumer) == 0 {
+						continue
+					}
+					if stream.Name != "my-stream-replicated" {
+						t.Fatalf("expected direct consumers only on the mirror origin stream, %s reported %d on %q",
+							url, len(stream.DirectConsumer), stream.Name)
+					}
+					if len(stream.DirectConsumer) != 1 {
+						t.Fatalf("expected exactly one direct consumer on %q but %s returned %d",
+							stream.Name, url, len(stream.DirectConsumer))
+					}
+					for _, dc := range stream.DirectConsumer {
+						if slices.ContainsFunc(stream.Consumer, func(c *ConsumerInfo) bool {
+							return c.Name == dc.Name
+						}) {
+							t.Fatalf("public consumer %q leaked into the direct consumer list of %q on %s",
+								dc.Name, stream.Name, url)
+						}
+					}
 					return nil
 				}
 			}
@@ -6340,50 +6461,13 @@ func TestMonitorAccountszMappingOrderReporting(t *testing.T) {
 	}
 }
 
-// createCallbackURL adds a callback query parameter for JSONP requests.
-func createCallbackURL(t *testing.T, endpoint string) string {
-	t.Helper()
-
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	params := u.Query()
-	params.Set("callback", "callback")
-
-	u.RawQuery = params.Encode()
-
-	return u.String()
-}
-
-// stripCallback removes the JSONP callback function from the response.
-// Returns the JSON body without the wrapping callback function.
-// If there's no callback function, the data is returned as is.
-func stripCallback(data []byte) []byte {
-	// Cut the JSONP callback function with the opening parentheses.
-	_, after, found := bytes.Cut(data, []byte("("))
-
-	if found {
-		return bytes.TrimSuffix(after, []byte(")"))
-	}
-
-	return data
-}
-
-// expectHealthStatus makes 1 regular and 1 JSONP request to the URL and checks the
-// HTTP status code, Content-Type header and health status string.
+// expectHealthStatus makes a request to the URL and checks the HTTP status code,
+// Content-Type header and health status string.
 func expectHealthStatus(t *testing.T, url string, statusCode int, wantStatus string) {
 	t.Helper()
 
-	// First check for regular requests.
 	body := readBodyEx(t, url, statusCode, appJSONContent)
 	checkHealthStatus(t, body, wantStatus)
-
-	// Another check for JSONP requests.
-	jsonpURL := createCallbackURL(t, url) // Adds a callback query param.
-	jsonpBody := readBodyEx(t, jsonpURL, statusCode, appJSContent)
-	checkHealthStatus(t, stripCallback(jsonpBody), wantStatus)
 }
 
 // checkHealthStatus checks the health status from a JSON response.
@@ -6649,44 +6733,6 @@ func TestServerHealthz(t *testing.T) {
 
 // When we converted ipq to use generics we still were using sync.Map. Currently you can not convert
 // any or any to a generic parameterized type. So this stopped working and panics.
-// Copyright 2013-2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-// Make sure that we do not run the http server for monitoring unless asked.
-// https://github.com/nats-io/nats-server/issues/2170
-// Just the ever increasing subs part.
-// Helper to map to connection name
-// getConnsIdleDurations returns a slice of parsed idle durations from a connection info slice.
-// sortedDurationsDesc checks if a time.Duration slice is sorted in descending order.
-// getIdleDurations returns a slice of idle durations from a connection info list up until now time.
-// sortedDurationsAsc checks if a time.Duration slice is sorted in ascending order.
-// Tests handle root
-// Make sure options for ConnInfo like subs=1, authuser, etc do not cause a race.
-// Make sure a bad client that is disconnected right away has proper values.
-// Make sure a bad client that tries to connect plain to TLS has proper values.
-// Create a connection to test ConnInfo
-// Benchmark our Connz generation. Don't use HTTP here, just measure server endpoint.
-// Helper function to check that a JS cluster is formed
-// https://github.com/nats-io/nats-server/issues/4144
-// createCallbackURL adds a callback query parameter for JSONP requests.
-// stripCallback removes the JSONP callback function from the response.
-// Returns the JSON body without the wrapping callback function.
-// If there's no callback function, the data is returned as is.
-// expectHealthStatus makes 1 regular and 1 JSONP request to the URL and checks the
-// HTTP status code, Content-Type header and health status string.
-// checkHealthStatus checks the health status from a JSON response.
-// checkHealthzEndpoint makes requests to the /healthz endpoint and checks the health status.
-// When we converted ipq to use generics we still were using sync.Map. Currently you can not convert
-// any or any to a generic parameterized type. So this stopped working and panics.
 func TestMonitorIpqzWithGenerics(t *testing.T) {
 	opts := DefaultMonitorOptions()
 	opts.JetStream = true
@@ -6791,4 +6837,126 @@ func TestMonitorVarzTLSCertEndDate(t *testing.T) {
 	check(t, v.LeafNode.TLSCertNotAfter)
 	check(t, v.MQTT.TLSCertNotAfter)
 	check(t, v.Websocket.TLSCertNotAfter)
+}
+
+func TestMonitorConnzAccountRace(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	accA, err := s.LookupAccount("A")
+	if err != nil {
+		t.Fatalf("LookupAccount A: %v", err)
+	}
+	accB, err := s.LookupAccount("B")
+	if err != nil {
+		t.Fatalf("LookupAccount B: %v", err)
+	}
+
+	// Real client bound to account A.
+	nc := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer nc.Close()
+
+	// Grab the server-side *client.
+	var c *client
+	checkFor(t, 2*time.Second, 5*time.Millisecond, func() error {
+		accA.mu.RLock()
+		defer accA.mu.RUnlock()
+		for cl := range accA.clients {
+			c = cl
+			return nil
+		}
+		return errors.New("could not find server-side client for account A")
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: write c.acc under c.mu, mimicking registerWithAccount /
+	// swapAccountAfterReload binding/swapping an account.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			c.mu.Lock()
+			if c.acc == accA {
+				c.acc = accB
+			} else {
+				c.acc = accA
+			}
+			c.mu.Unlock()
+		}
+	}()
+
+	// Reader: account-filter path reads client.acc / client.acc.Name under only s.mu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := s.Connz(&ConnzOptions{Account: "A"}); err != nil {
+				t.Errorf("Connz error: %v", err)
+				return
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Restore so shutdown/cleanup is consistent.
+	c.mu.Lock()
+	c.acc = accA
+	c.mu.Unlock()
+}
+
+func TestConnzClosedSubsDetailNoSharedMutation(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// Inject a closed client with subscription detail directly into the ring buffer.
+	cc := &closedClient{}
+	cc.Cid = 1
+	cc.subs = []SubDetail{{Subject: "foo.bar"}}
+	cc.NumSubs = 1
+	s.mu.Lock()
+	s.closed.append(cc)
+	s.mu.Unlock()
+
+	// Concurrently request closed connections with subscription detail.
+	var wg sync.WaitGroup
+	opts := &ConnzOptions{State: ConnClosed, SubscriptionsDetail: true}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Connz(opts); err != nil {
+				t.Errorf("Error on Connz: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The shared cached object must not have been mutated.
+	s.mu.Lock()
+	leaked := cc.SubsDetail != nil
+	s.mu.Unlock()
+	require_False(t, leaked)
+
+	// A plain closed-conn query must not carry SubsDetail.
+	c, err := s.Connz(&ConnzOptions{State: ConnClosed})
+	require_NoError(t, err)
+	require_Len(t, len(c.Conns), 1)
+	if c.Conns[0].SubsDetail != nil {
+		t.Fatalf("Plain closed-conn query unexpectedly carried SubsDetail: %+v", c.Conns[0].SubsDetail)
+	}
 }

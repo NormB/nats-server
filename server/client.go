@@ -943,10 +943,10 @@ func (c *client) applyAccountLimits() {
 			atomic.StoreInt32(&c.mpay, clampInt64ToInt32(uc.Limits.Payload))
 			c.msubs = clampInt64ToInt32(uc.Limits.Subs)
 			if uc.IssuerAccount != _EMPTY_ && uc.IssuerAccount != uc.Issuer {
-				if scope, ok := c.acc.signingKeys[uc.Issuer]; ok {
+				if scope, ok := c.acc.hasIssuer(uc.Issuer); ok {
 					if userScope, ok := scope.(*jwt.UserScope); ok {
 						// if signing key disappeared or changed and we don't get here, the client will be disconnected
-						c.mpay = clampInt64ToInt32(userScope.Template.Limits.Payload)
+						atomic.StoreInt32(&c.mpay, clampInt64ToInt32(userScope.Template.Limits.Payload))
 						c.msubs = clampInt64ToInt32(userScope.Template.Limits.Subs)
 					}
 				}
@@ -970,13 +970,13 @@ func (c *client) applyAccountLimits() {
 	if mSubs == 0 {
 		mSubs = jwt.NoLimit
 	}
-	wasUnlimited := c.mpay == jwt.NoLimit
+	wasUnlimited := atomic.LoadInt32(&c.mpay) == jwt.NoLimit
 	if minLimit(&c.mpay, mPay) && !wasUnlimited {
-		c.Errorf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
+		c.Debugf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
 	}
 	wasUnlimited = c.msubs == jwt.NoLimit
 	if minLimit(&c.msubs, mSubs) && !wasUnlimited {
-		c.Errorf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
+		c.Debugf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
 	}
 	if c.subsAtLimit() {
 		go func() {
@@ -1050,6 +1050,24 @@ func (c *client) RegisterNkeyUser(user *NkeyUser) error {
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *client) updateDefaultPermissions(perms *Permissions) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.user == nil || !c.user.defaultPerms {
+		return false
+	}
+	if perms == nil {
+		c.user.Permissions = nil
+		c.perms = nil
+		c.mperms = nil
+		c.darray = nil
+		return true
+	}
+	c.user.Permissions = perms.clone()
+	c.setPermissions(c.user.Permissions)
+	return true
 }
 
 func splitSubjectQueue(sq string) ([]byte, []byte, error) {
@@ -2626,7 +2644,7 @@ func (c *client) generateClientInfoJSON(info Info, includeClientIP bool) []byte 
 	if includeClientIP {
 		info.ClientIP = c.host
 	}
-	info.MaxPayload = c.mpay
+	info.MaxPayload = atomic.LoadInt32(&c.mpay)
 	if c.isWebsocket() {
 		info.ClientConnectURLs = info.WSConnectURLs
 		// Otherwise lame duck info can panic
@@ -4960,6 +4978,12 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 		flags |= pmrIgnoreEmptyQueueFilter
 	}
 
+	// If this is a response service import that arrived via a route, allow delivery
+	// to route subscriptions. Service import replies use one-time _R_ subjects.
+	if isResponse && c.kind == ROUTER {
+		flags |= pmrAllowSendFromRouteToRoute
+	}
+
 	// We will be calling back into processMsgResults since we are now being called as a normal sub.
 	// We need to take care of the c.in.rts, so save off what is there and use a local version. We
 	// will put back what was there after.
@@ -6628,14 +6652,6 @@ func isClientProbeTLSHandshakeError(err error) bool {
 	// Conn is only set by crypto/tls when the invalid record was the peer's
 	// initial handshake bytes, which is the non-TLS probe/load-balancer case.
 	return errors.As(err, &recordHeaderErr) && recordHeaderErr.Conn != nil
-}
-
-// getRawAuthUserLock returns the raw auth user for the client.
-// Will acquire the client lock.
-func (c *client) getRawAuthUserLock() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.getRawAuthUser()
 }
 
 // getRawAuthUser returns the raw auth user for the client.

@@ -6667,6 +6667,292 @@ func TestJetStreamClusterMetaRecoveryUpdatesDeletesConsumers(t *testing.T) {
 	require_Len(t, len(ru.updateConsumers), 0)
 }
 
+func TestJetStreamClusterMetaRecoverySnapshotReconcilesStagedUpdates(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	require_NotNil(t, ml)
+	js := ml.getJetStream()
+
+	// Helpers to build the recovery log entries that stage operations.
+	addStream := func(name string) *Entry {
+		return &Entry{EntryNormal, encodeAddStreamAssignment(&streamAssignment{
+			Client: &ClientInfo{Account: globalAccountName},
+			Config: &StreamConfig{Name: name, Storage: FileStorage},
+		})}
+	}
+	updateStream := func(name string) *Entry {
+		return &Entry{EntryNormal, encodeUpdateStreamAssignment(&streamAssignment{
+			Client: &ClientInfo{Account: globalAccountName},
+			Config: &StreamConfig{Name: name, Storage: FileStorage},
+		})}
+	}
+	addConsumer := func(stream, name string) *Entry {
+		return &Entry{EntryNormal, encodeAddConsumerAssignment(&consumerAssignment{
+			Client: &ClientInfo{Account: globalAccountName}, Stream: stream, Name: name,
+			Config: &ConsumerConfig{Name: name},
+		})}
+	}
+	delConsumer := func(stream, name string) *Entry {
+		return &Entry{EntryNormal, encodeDeleteConsumerAssignment(&consumerAssignment{
+			Client: &ClientInfo{Account: globalAccountName}, Stream: stream, Name: name,
+			Config: &ConsumerConfig{Name: name},
+		})}
+	}
+
+	// snapStream describes a stream (and its consumers) present in the incoming compacted snapshot.
+	type snapStream struct {
+		name      string
+		consumers []string
+	}
+	encodeSnapshot := func(t *testing.T, streams ...snapStream) []*Entry {
+		t.Helper()
+		asa := map[string]*streamAssignment{}
+		for _, s := range streams {
+			cfg := &StreamConfig{Name: s.name, Storage: FileStorage}
+			cfgJSON, err := json.Marshal(cfg)
+			require_NoError(t, err)
+			sa := &streamAssignment{Client: &ClientInfo{Account: globalAccountName}, Config: cfg, ConfigJSON: cfgJSON}
+			for _, cn := range s.consumers {
+				if sa.consumers == nil {
+					sa.consumers = map[string]*consumerAssignment{}
+				}
+				ccfg := &ConsumerConfig{Name: cn}
+				ccfgJSON, err := json.Marshal(ccfg)
+				require_NoError(t, err)
+				sa.consumers[cn] = &consumerAssignment{
+					Client: &ClientInfo{Account: globalAccountName}, Stream: s.name, Name: cn,
+					Config: ccfg, ConfigJSON: ccfgJSON,
+				}
+			}
+			asa[s.name] = sa
+		}
+		snap, _, _, err := js.encodeMetaSnapshot(map[string]map[string]*streamAssignment{globalAccountName: asa})
+		require_NoError(t, err)
+		return []*Entry{{EntrySnapshot, snap}}
+	}
+
+	// Collect the names staged in each part of ru, sorted for stable comparison.
+	streamNames := func(m map[string]*streamAssignment) []string {
+		var out []string
+		for _, sa := range m {
+			out = append(out, sa.Config.Name)
+		}
+		slices.Sort(out)
+		return out
+	}
+	consumerNames := func(m map[string]map[string]*consumerAssignment) []string {
+		var out []string
+		for _, cs := range m {
+			for _, ca := range cs {
+				out = append(out, ca.Name)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+	assertNames := func(t *testing.T, label string, got, want []string) {
+		t.Helper()
+		want = slices.Clone(want)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("%s: got %v, want %v", label, got, want)
+		}
+	}
+
+	for _, test := range []struct {
+		name string
+		// Entries staged during recovery, before the snapshot arrives.
+		entries []*Entry
+		// Streams (and their consumers) the compacted snapshot contains.
+		snapshot []snapStream
+		// Staged state expected after the entries, before the snapshot reconciles them.
+		preStreams   []string
+		preUpdates   []string
+		preConsumers []string
+		preRemoves   []string
+		// Staged state expected after the snapshot has reconciled the staged updates.
+		wantStreams   []string
+		wantUpdates   []string
+		wantConsumers []string
+		wantRemoves   []string
+	}{
+		{
+			// A stream staged for add that the snapshot omits is a phantom and must be dropped;
+			// a stream the snapshot contains is (re)staged as an add.
+			name:        "deleted stream",
+			entries:     []*Entry{addStream("TEST")},
+			snapshot:    []snapStream{{name: "KEEP"}},
+			preStreams:  []string{"TEST"},
+			wantStreams: []string{"KEEP"},
+		},
+		{
+			// When the stream itself is superseded, its staged consumer add (CA) and remove (CB)
+			// must be dropped along with it.
+			name: "deleted stream with consumers",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "CA"),
+				addConsumer("TEST", "CB"),
+				delConsumer("TEST", "CB"),
+			},
+			snapshot:     []snapStream{{name: "KEEP"}},
+			preStreams:   []string{"TEST"},
+			preConsumers: []string{"CA"},
+			preRemoves:   []string{"CB"},
+			wantStreams:  []string{"KEEP"},
+		},
+		{
+			// The stream survives, but a staged consumer (C2) the snapshot omits is a phantom and
+			// must be dropped; the consumer the snapshot still contains (C1) is kept.
+			name: "deleted consumer",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "C1"),
+				addConsumer("TEST", "C2"),
+			},
+			snapshot:      []snapStream{{name: "TEST", consumers: []string{"C1"}}},
+			preStreams:    []string{"TEST"},
+			preConsumers:  []string{"C1", "C2"},
+			wantStreams:   []string{"TEST"},
+			wantConsumers: []string{"C1"},
+		},
+		{
+			// Nothing is a phantom: every staged consumer is present in the snapshot, and the
+			// snapshot also (re)stages its own consumers (C2 here was not staged via an entry).
+			name: "snapshot adds consumer",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "C1"),
+			},
+			snapshot:      []snapStream{{name: "TEST", consumers: []string{"C1", "C2"}}},
+			preStreams:    []string{"TEST"},
+			preConsumers:  []string{"C1"},
+			wantStreams:   []string{"TEST"},
+			wantConsumers: []string{"C1", "C2"},
+		},
+		{
+			// Both paths at once: stream KEEP (and consumer KC) survive, while stream GONE (and
+			// its consumer GC) are superseded and dropped.
+			name: "mixed stream delete",
+			entries: []*Entry{
+				addStream("KEEP"),
+				addConsumer("KEEP", "KC"),
+				addStream("GONE"),
+				addConsumer("GONE", "GC"),
+			},
+			snapshot:      []snapStream{{name: "KEEP", consumers: []string{"KC"}}},
+			preStreams:    []string{"GONE", "KEEP"},
+			preConsumers:  []string{"GC", "KC"},
+			wantStreams:   []string{"KEEP"},
+			wantConsumers: []string{"KC"},
+		},
+		{
+			// An empty snapshot (all streams deleted) supersedes everything staged.
+			name: "empty snapshot",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "C1"),
+			},
+			snapshot:     nil,
+			preStreams:   []string{"TEST"},
+			preConsumers: []string{"C1"},
+		},
+		{
+			// A stream created and then updated during recovery is staged in both addStreams and
+			// updateStreams. When superseded, the addStreams loop must clear the updateStreams entry
+			// too (so the update is not later applied against a stream that no longer exists).
+			name: "added-and-updated stream",
+			entries: []*Entry{
+				addStream("TEST"),
+				updateStream("TEST"),
+			},
+			snapshot:    []snapStream{{name: "KEEP"}},
+			preStreams:  []string{"TEST"},
+			preUpdates:  []string{"TEST"},
+			wantStreams: []string{"KEEP"},
+		},
+		{
+			// A stream created and then updated during recovery is staged in both addStreams and
+			// updateStreams. When the snapshot keeps the stream it re-stages it as an add, which must
+			// clear the now-stale staged update. Otherwise recovery completion applies the add and then
+			// reapplies the older update (adds run before updates), rolling the stream config back away
+			// from the snapshot state.
+			name: "added-and-updated stream kept",
+			entries: []*Entry{
+				addStream("TEST"),
+				updateStream("TEST"),
+			},
+			snapshot:    []snapStream{{name: "TEST"}},
+			preStreams:  []string{"TEST"},
+			preUpdates:  []string{"TEST"},
+			wantStreams: []string{"TEST"},
+			// wantUpdates intentionally empty: the snapshot's re-add supersedes the stale staged update.
+		},
+		{
+			// A stream staged only in updateStreams (its add is outside this recovery batch) is
+			// reconciled by the dedicated updateStreams loop: when superseded it and its staged
+			// consumer ops are dropped. This is the path the addStreams loop does not cover.
+			name: "update-only stream",
+			entries: []*Entry{
+				updateStream("GONE"),
+				addConsumer("GONE", "GC"),
+			},
+			snapshot:     []snapStream{{name: "KEEP"}},
+			preUpdates:   []string{"GONE"},
+			preConsumers: []string{"GC"},
+			wantStreams:  []string{"KEEP"},
+		},
+		{
+			// A stream staged only via an update, that the snapshot keeps: the snapshot re-stages it as
+			// an add which supersedes the now-stale staged update (so it is not reapplied after the add
+			// at recovery completion). The phantom consumer under it (C2) is still dropped; C1 survives.
+			name: "update-only stream kept",
+			entries: []*Entry{
+				updateStream("TEST"),
+				addConsumer("TEST", "C1"),
+				addConsumer("TEST", "C2"),
+			},
+			snapshot:     []snapStream{{name: "TEST", consumers: []string{"C1"}}},
+			preUpdates:   []string{"TEST"},
+			preConsumers: []string{"C1", "C2"},
+			wantStreams:  []string{"TEST"},
+			// wantUpdates intentionally empty: the snapshot's re-add supersedes the stale staged update.
+			wantConsumers: []string{"C1"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Need to be recovering so that we accumulate recoveryUpdates.
+			js.setMetaRecovering()
+			ru := &recoveryUpdates{
+				removeStreams:   make(map[string]*streamAssignment),
+				removeConsumers: make(map[string]map[string]*consumerAssignment),
+				addStreams:      make(map[string]*streamAssignment),
+				updateStreams:   make(map[string]*streamAssignment),
+				updateConsumers: make(map[string]map[string]*consumerAssignment),
+			}
+
+			// Stage the recovery entries, then verify what they staged (so the snapshot assertions
+			// below are not vacuously satisfied by entries that never staged anything).
+			_, _, err := js.applyMetaEntries(test.entries, ru)
+			require_NoError(t, err)
+			assertNames(t, "pre stream adds", streamNames(ru.addStreams), test.preStreams)
+			assertNames(t, "pre stream updates", streamNames(ru.updateStreams), test.preUpdates)
+			assertNames(t, "pre consumers", consumerNames(ru.updateConsumers), test.preConsumers)
+			assertNames(t, "pre removes", consumerNames(ru.removeConsumers), test.preRemoves)
+
+			// Apply the compacted snapshot, which reconciles the staged updates against it.
+			_, _, err = js.applyMetaEntries(encodeSnapshot(t, test.snapshot...), ru)
+			require_NoError(t, err)
+			assertNames(t, "stream adds", streamNames(ru.addStreams), test.wantStreams)
+			assertNames(t, "stream updates", streamNames(ru.updateStreams), test.wantUpdates)
+			assertNames(t, "consumer adds", consumerNames(ru.updateConsumers), test.wantConsumers)
+			assertNames(t, "consumer removes", consumerNames(ru.removeConsumers), test.wantRemoves)
+		})
+	}
+}
+
 func TestJetStreamClusterMetaRecoveryRecreateFileStreamAsMemory(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -7401,8 +7687,8 @@ func TestJetStreamClusterStreamHealthCheckMustNotRecreate(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7507,8 +7793,8 @@ func TestJetStreamClusterStreamHealthCheckMustNotDeleteEarly(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7581,8 +7867,8 @@ func TestJetStreamClusterStreamHealthCheckOnlyReportsSkew(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7682,9 +7968,13 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 
 	waitForConsumerAssignments := func() {
 		t.Helper()
-		checkFor(t, 5*time.Second, time.Second, func() error {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7693,9 +7983,13 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 	}
 	waitForNoConsumerAssignments := func() {
 		t.Helper()
-		checkFor(t, 5*time.Second, time.Second, func() error {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") != nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca != nil {
 					return fmt.Errorf("stream assignment still available on %s", s.Name())
 				}
 			}
@@ -7709,8 +8003,8 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7750,6 +8044,15 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 	n := rg.node
 	n.Stop()
 	n.WaitForStop()
+
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if o.isMonitorRunning() {
+			return errors.New("monitor goroutine still running")
+		}
+		return nil
+	})
 
 	// The RAFT node should be closed. Checking health must not change that.
 	// Simulates a race condition where we're shutting down.
@@ -7799,7 +8102,11 @@ func TestJetStreamClusterConsumerHealthCheckMustNotDeleteEarly(t *testing.T) {
 		t.Helper()
 		checkFor(t, 5*time.Second, time.Second, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7814,8 +8121,8 @@ func TestJetStreamClusterConsumerHealthCheckMustNotDeleteEarly(t *testing.T) {
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7875,7 +8182,11 @@ func TestJetStreamClusterConsumerHealthCheckOnlyReportsSkew(t *testing.T) {
 		t.Helper()
 		checkFor(t, 5*time.Second, time.Second, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7890,8 +8201,8 @@ func TestJetStreamClusterConsumerHealthCheckOnlyReportsSkew(t *testing.T) {
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -8083,6 +8394,221 @@ func TestJetStreamClusterConsumerHealthCheckSurfacesAssignmentErr(t *testing.T) 
 	ca.err = nil
 	sjs.mu.Unlock()
 	require_NoError(t, sjs.isConsumerHealthy(mset, "CONSUMER", ca))
+}
+
+func TestJetStreamClusterConsumerHealthCheckStreamMissingNoLockLeak(t *testing.T) {
+	js := &jetStream{}
+	ca := &consumerAssignment{}
+	err := js.isConsumerHealthy(nil, "consumer", ca)
+	require_Error(t, err, errors.New("stream missing"))
+
+	// The JS lock must have been released. Attempt to acquire the write lock
+	// from a separate goroutine with a timeout so a leaked lock does not hang
+	// the test forever.
+	done := make(chan struct{})
+	go func() {
+		js.mu.Lock()
+		defer js.mu.Unlock()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Lock acquired, no leak.
+	case <-time.After(2 * time.Second):
+		t.Fatal("js.mu lock leaked: could not acquire write lock after isConsumerHealthy returned")
+	}
+}
+
+func TestJetStreamClusterProcessStreamAssignmentResults(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// The result handler runs on the metadata leader.
+	ml := c.leader()
+	require_NotNil(t, ml)
+	mjs := ml.getJetStream()
+
+	// Malformed payloads and unknown accounts are dropped silently.
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, []byte("{not-json"))
+	badAcc, err := json.Marshal(&streamAssignmentResult{Account: "DOES_NOT_EXIST", Stream: "TEST"})
+	require_NoError(t, err)
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
+
+	// Reset the assignment so it's treated as not-yet-responded, and ensure we're
+	// inside the canDelete window.
+	mjs.mu.Lock()
+	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	require_True(t, sa != nil)
+	sa.clearResponded()
+	sa.Created = time.Now()
+	mjs.mu.Unlock()
+
+	// Craft a rejection result, as a member sends after a failed local create.
+	result := &streamAssignmentResult{
+		Account: globalAccountName,
+		Stream:  "TEST",
+		Response: &JSApiStreamCreateResponse{
+			ApiResponse: ApiResponse{
+				Type:  JSApiStreamCreateResponseType,
+				Error: NewJSStreamLimitsError(errors.New("synthetic limits error")),
+			},
+		},
+	}
+	b, err := json.Marshal(result)
+	require_NoError(t, err)
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, b)
+
+	// The handler forwards the response, so the assignment is now marked responded.
+	mjs.mu.Lock()
+	responded := sa.hasResponded()
+	mjs.mu.Unlock()
+	require_True(t, responded)
+
+	// The rejected assignment must be cleaned up from the meta layer.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		mjs.mu.Lock()
+		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		mjs.mu.Unlock()
+		if sa != nil {
+			return fmt.Errorf("stream assignment still present")
+		}
+		return nil
+	})
+}
+
+func TestJetStreamClusterProcessStreamAssignmentResultsRetry(t *testing.T) {
+	sc := createJetStreamSuperCluster(t, 3, 2)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	ml := sc.leader()
+	require_NotNil(t, ml)
+	mjs := ml.getJetStream()
+
+	// Determine the assigned cluster and an alternate to retry into.
+	mjs.mu.Lock()
+	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	require_True(t, sa != nil)
+	assignedCluster := sa.Client.Cluster
+	var alternate string
+	for _, cl := range sc.clusters {
+		if cl.name != assignedCluster {
+			alternate = cl.name
+			break
+		}
+	}
+	// Prepare the assignment so the retry branch is eligible: fresh, unresponded,
+	// no fixed placement, and with an alternate cluster to fall back to.
+	sa.clearResponded()
+	sa.Created = time.Now()
+	sa.Config.Placement = nil
+	sa.Client.Alternates = []string{alternate}
+	mjs.mu.Unlock()
+	require_NotEqual(t, alternate, _EMPTY_)
+
+	// Craft an insufficient-resources rejection.
+	result := &streamAssignmentResult{
+		Account: globalAccountName,
+		Stream:  "TEST",
+		Response: &JSApiStreamCreateResponse{
+			ApiResponse: ApiResponse{
+				Type:  JSApiStreamCreateResponseType,
+				Error: NewJSInsufficientResourcesError(),
+			},
+		},
+	}
+	b, err := json.Marshal(result)
+	require_NoError(t, err)
+
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, b)
+
+	// The retry branch re-proposes the assignment and flags it as reassigning.
+	mjs.mu.Lock()
+	nsa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
+	responded := nsa.hasResponded()
+	reassigning := nsa.reassigning
+	mjs.mu.Unlock()
+	// Retry returns before responding, so the client is not told it failed.
+	require_False(t, responded)
+	require_True(t, reassigning)
+}
+
+func TestJetStreamClusterProcessConsumerAssignmentResults(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "CONSUMER"})
+	require_NoError(t, err)
+
+	ml := c.leader()
+	require_NotNil(t, ml)
+	mjs := ml.getJetStream()
+
+	// Malformed payloads and unknown accounts are dropped silently.
+	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, []byte("{not-json"))
+	badAcc, err := json.Marshal(&consumerAssignmentResult{Account: "DOES_NOT_EXIST", Stream: "TEST", Consumer: "CONSUMER"})
+	require_NoError(t, err)
+	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
+
+	mjs.mu.Lock()
+	ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	require_True(t, ca != nil)
+	ca.clearResponded()
+	ca.Created = time.Now()
+	mjs.mu.Unlock()
+
+	result := &consumerAssignmentResult{
+		Account:  globalAccountName,
+		Stream:   "TEST",
+		Consumer: "CONSUMER",
+		Response: &JSApiConsumerCreateResponse{
+			ApiResponse: ApiResponse{
+				Type:  JSApiConsumerCreateResponseType,
+				Error: NewJSConsumerStoreFailedError(errors.New("synthetic store error")),
+			},
+		},
+	}
+	b, err := json.Marshal(result)
+	require_NoError(t, err)
+	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, b)
+
+	// The handler is synchronous: the assignment must now be marked responded and
+	// carry the recorded assignment-level error.
+	mjs.mu.Lock()
+	responded := ca.hasResponded()
+	caErr := ca.err
+	mjs.mu.Unlock()
+	require_True(t, responded)
+	require_Error(t, caErr, NewJSClusterNotAssignedError())
 }
 
 func TestJetStreamClusterStreamHealthCheckRecoversAfterSuccessfulUpdate(t *testing.T) {
@@ -11379,7 +11905,11 @@ func TestJetStreamClusterMetaRecoveryRecreateConsumer(t *testing.T) {
 		if newConsumer {
 			// Need to wait for the consumer to be deleted on our selected server.
 			checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-				if rs.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") != nil {
+				sjs := rs.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca != nil {
 					return errors.New("still assigned")
 				}
 				return nil

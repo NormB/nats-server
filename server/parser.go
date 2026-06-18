@@ -181,7 +181,8 @@ func (c *client) parse(buf []byte) error {
 							s.mu.Lock()
 							user, exists := s.users[noAuthUser]
 							s.mu.Unlock()
-							if exists {
+							// Enforce the same connection restrictions as CONNECT before allowing.
+							if exists && !user.ProxyRequired && c.connectionTypeAllowed(user.AllowedConnectionTypes) {
 								c.RegisterUser(user)
 								c.mu.Lock()
 								c.clearAuthTimer()

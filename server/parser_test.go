@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/nats-io/jwt/v2"
 )
 
 func dummyClient() *client {
@@ -752,6 +754,61 @@ func TestParsePingNoAuthUserExceptionsAndRestrictions(t *testing.T) {
 			require_True(t, c.flags.isSet(connectReceived))
 		})
 	}
+}
+
+func TestParsePingNoAuthUserEnforcesUserRestrictions(t *testing.T) {
+	newServer := func(user *User) *Server {
+		opts := defaultServerOptions
+		s := New(&opts)
+		s.opts.NoAuthUser = user.Username
+		s.users = map[string]*User{user.Username: user}
+		return s
+	}
+
+	newAuthPendingClient := func(s *Server, ws *websocket) *client {
+		c := &client{
+			srv: s, kind: CLIENT, ws: ws,
+			atmr: time.AfterFunc(time.Minute, func() {}),
+		}
+		c.flags.set(expectConnect)
+		t.Cleanup(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.clearAuthTimer()
+		})
+		return c
+	}
+
+	t.Run("AllowedConnectionTypes", func(t *testing.T) {
+		// no_auth_user restricted to WebSocket connections only.
+		s := newServer(&User{
+			Username:               "foo",
+			AllowedConnectionTypes: map[string]struct{}{jwt.ConnectionTypeWebsocket: {}},
+		})
+
+		// A standard TCP client must be rejected, just like the CONNECT path.
+		c := newAuthPendingClient(s, nil)
+		require_Error(t, c.parse([]byte("PING\r\n")), ErrAuthentication)
+		require_False(t, c.flags.isSet(connectReceived))
+
+		// A WebSocket client satisfies the restriction and is allowed.
+		c = newAuthPendingClient(s, &websocket{})
+		require_NoError(t, c.parse([]byte("PING\r\n")))
+		require_True(t, c.flags.isSet(connectReceived))
+	})
+
+	t.Run("ProxyRequired", func(t *testing.T) {
+		// no_auth_user that may only connect through a trusted proxy. A
+		// connection reaching the pre-CONNECT fast path never carries a proxy
+		// signature, so it must always be rejected.
+		s := newServer(&User{Username: "foo", ProxyRequired: true})
+
+		for _, ws := range []*websocket{nil, {}} {
+			c := newAuthPendingClient(s, ws)
+			require_Error(t, c.parse([]byte("PING\r\n")), ErrAuthentication)
+			require_False(t, c.flags.isSet(connectReceived))
+		}
+	})
 }
 
 func TestParsePingAllowedAfterConnectForNonClients(t *testing.T) {

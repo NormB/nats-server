@@ -573,6 +573,41 @@ func TestStoreCompactCleansUpDmap(t *testing.T) {
 	}
 }
 
+func TestStoreCompactFullyDeletedRange(t *testing.T) {
+	config := func() StreamConfig {
+		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgsPer: 0}
+	}
+	testAllStoreAllPermutations(
+		t, false, config(),
+		func(t *testing.T, fs StreamStore) {
+			// Publish some messages.
+			for range 3 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+			}
+
+			// Remove all messages in the range we're about to compact,
+			// keeping the first message so FirstSeq stays at 1.
+			_, err := fs.RemoveMsg(2)
+			require_NoError(t, err)
+			_, err = fs.RemoveMsg(3)
+			require_NoError(t, err)
+
+			state := fs.State()
+			require_Equal(t, state.FirstSeq, 1)
+			require_Equal(t, state.LastSeq, 3)
+
+			// Compact to a deleted sequence, and the stream is left empty.
+			_, err = fs.Compact(2)
+			require_NoError(t, err)
+			state = fs.State()
+			require_Equal(t, state.Msgs, 0)
+			require_Equal(t, state.LastSeq, 3)
+			require_Equal(t, state.FirstSeq, state.LastSeq+1)
+			require_True(t, state.FirstTime.IsZero())
+		})
+}
+
 func TestStoreTruncateCleansUpDmap(t *testing.T) {
 	config := func() StreamConfig {
 		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgsPer: 0}
@@ -1078,6 +1113,41 @@ func TestFileStoreMultiLastSeqsAndLoadLastMsgWithLazySubjectState(t *testing.T) 
 			sm, err = fs.LoadLastMsg("foo", nil)
 			require_NoError(t, err)
 			require_Equal(t, sm.seq, 2)
+		},
+	)
+}
+
+func TestStoreNumPendingLastPerSubjectExcludeOvercount(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}},
+		func(t *testing.T, fs StreamStore) {
+			put := func(subj string) {
+				_, _, err := fs.StoreMsg(subj, nil, []byte("x"), 0)
+				require_NoError(t, err)
+			}
+			// foo.A occupies seqs 1-10 (entirely below our start seq).
+			for range 10 {
+				put("foo.A")
+			}
+			put("foo.B")                              // seq 11
+			put("foo.C")                              // seq 12
+			require_NoError(t, fs.SkipMsgs(13, 87))   // skip 13-99
+			put("foo.B")                              // seq 100
+			require_NoError(t, fs.SkipMsgs(101, 899)) // skip 101-999
+			put("foo.C")                              // seq 1000
+
+			// lastPerSubject starting at seq 13: foo.A's last (10) is below 13 so it
+			// contributes 0; foo.B (last 100) and foo.C (last 1000) each contribute 1.
+			total, _, err := fs.NumPending(13, "foo.*", true)
+			require_NoError(t, err)
+			require_Equal(t, total, 2)
+
+			filters := gsl.NewSublist[struct{}]()
+			filters.Insert("foo.*", struct{}{})
+			total, _, err = fs.NumPendingMulti(13, filters, true)
+			require_NoError(t, err)
+			require_Equal(t, total, 2)
 		},
 	)
 }

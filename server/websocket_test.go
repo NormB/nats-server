@@ -5418,3 +5418,53 @@ func TestWSCompressedFragmentsDoNotShareNbPoolBuffer(t *testing.T) {
 	}
 	require_True(t, bytes.Equal(later, saved))
 }
+
+func TestWSUpgradeMQTTOnlyWhenEnabled(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		mqttPort int
+		path     string
+		kind     int
+		err      string
+	}{
+		{"mqtt disabled rejects /mqtt", 0, mqttWSPath, 0, "mqtt websocket endpoint not enabled"},
+		{"mqtt enabled allows /mqtt", -1, mqttWSPath, MQTT, _EMPTY_},
+		{"mqtt disabled allows client path", 0, "/", CLIENT, _EMPTY_},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := testWSOptions()
+			opts.MQTT.Port = test.mqttPort
+			s := &Server{opts: opts}
+			s.wsSetOriginOptions(&opts.Websocket)
+
+			rw := &testResponseWriter{}
+			req := testWSCreateValidReq()
+			req.URL = &url.URL{Path: test.path}
+			res, err := s.wsUpgrade(rw, req)
+
+			if test.err != _EMPTY_ {
+				if err == nil || !strings.Contains(err.Error(), test.err) {
+					t.Fatalf("Expected error %q, got %v", test.err, err)
+				}
+				if res != nil {
+					t.Fatalf("Should not have returned a result, got %v", res)
+				}
+				expected := fmt.Sprintf("%v%s\n", http.StatusNotFound, http.StatusText(http.StatusNotFound))
+				if got := rw.buf.String(); got != expected {
+					t.Fatalf("Expected response %q, got %q", expected, got)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if res == nil {
+				t.Fatal("Expected an upgrade result, got nil")
+			}
+			if res.kind != test.kind {
+				t.Fatalf("Expected upgrade kind %v, got %v", test.kind, res.kind)
+			}
+		})
+	}
+}

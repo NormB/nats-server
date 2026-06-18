@@ -1989,6 +1989,69 @@ func TestServerEventsStatsZ(t *testing.T) {
 	require_Equal(t, m.Stats.StalledClients, 3)
 }
 
+func TestServerEventsStatsZForcedBroadcastNotRateLimited(t *testing.T) {
+	// Tests will set this generally faster, but here we want the rate limiter
+	// to actually be active.
+	original := statszRateLimit
+	statszRateLimit = time.Hour
+	defer func() { statszRateLimit = original }()
+
+	s, opts := runTrustedServer(t)
+	defer s.Shutdown()
+
+	acc, akp := createAccount(s)
+	require_NoError(t, s.setSystemAccount(acc))
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	nc, err := nats.Connect(url, createUserCreds(t, s, akp))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	subj := fmt.Sprintf(serverStatsSubj, s.ID())
+
+	// Arrange so that the rate limiter would suppress any broadcast:
+	// stop the periodic heartbeat timer so it cannot produce a broadcast,
+	// and set lastStatsz to "now" so we are well within the interval.
+	s.mu.Lock()
+	if s.sys.stmr != nil {
+		s.sys.stmr.Stop()
+	}
+	s.sys.cstatsz = time.Hour
+	s.sys.statsz = time.Hour
+	s.sys.lastStatsz = time.Now()
+	s.mu.Unlock()
+
+	// Let any inflight startup statsz goroutines finish before we subscribe,
+	// so they cannot land in our subscription as a false positive.
+	time.Sleep(300 * time.Millisecond)
+
+	// From here on the only thing that can publish to this subject is an
+	// un-suppressed broadcast.
+	sub, err := nc.SubscribeSync(subj)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	// Re-arm the suppression window right before the request.
+	s.mu.Lock()
+	s.sys.lastStatsz = time.Now()
+	s.mu.Unlock()
+
+	// Issue a forced (no-reply) STATSZ request. This is the path a new meta
+	// leader uses to force an immediate broadcast. It must reset lastStatsz
+	// and broadcast immediately even though we are within the rate-limit
+	// interval.
+	s.statszReq(nil, nil, nil, subj, _EMPTY_, nil, nil)
+
+	// Make sure it is a statsz from our server.
+	msg, err := sub.NextMsg(2 * time.Second)
+	require_NoError(t, err)
+	var m ServerStatsMsg
+	require_NoError(t, json.Unmarshal(msg.Data, &m))
+	require_Equal(t, m.Server.ID, s.ID())
+	require_Equal(t, m.Stats.Connections, 1)
+}
+
 func TestServerEventsHealthZSingleServer(t *testing.T) {
 	type healthzResp struct {
 		Healthz HealthStatus `json:"data"`
@@ -4126,5 +4189,105 @@ func TestSendInternalAccountMsgWithReplyDoesNotMutateHeaderSlice(t *testing.T) {
 	got := hdr[:cap(hdr)]
 	if !bytes.Equal(got, snapshot) {
 		t.Fatalf("hdr backing array was mutated by send:\n want: %q\n  got: %q", snapshot, got)
+	}
+}
+
+func TestEventsResetChSendNoPanicAfterShutdownEventing(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+
+	// Simulate a sender that grabbed the channel reference before it was nil-ed,
+	// exactly as the production senders do under s.mu.
+	s.mu.Lock()
+	if s.sys == nil || s.sys.resetCh == nil {
+		s.mu.Unlock()
+		t.Fatal("expected system eventing to be running")
+	}
+	rc := s.sys.resetCh
+	s.mu.Unlock()
+
+	// Drive eventing shutdown to completion. With the old code this closed rc.
+	s.shutdownEventing()
+
+	// Stand in for the (now exited) internal send loop so that, on a healthy
+	// open channel, the send can complete.
+	go func() { <-rc }()
+
+	// Perform the send using the same select-against-quitCh pattern as the
+	// production senders. On the buggy code rc is closed and this panics.
+	done := make(chan any, 1)
+	go func() {
+		defer func() { done <- recover() }()
+		select {
+		case rc <- struct{}{}:
+		case <-s.quitCh:
+		}
+	}()
+
+	select {
+	case r := <-done:
+		if r != nil {
+			t.Fatalf("send on resetCh panicked during shutdown: %v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("send on resetCh blocked unexpectedly")
+	}
+}
+
+func TestEventsRemoteLatencyUpdateNilLatency(t *testing.T) {
+	s, _ := runTrustedServer(t)
+	defer s.Shutdown()
+
+	// Enable internal events by setting a system account.
+	sacc, _ := createAccount(s)
+	require_NoError(t, s.setSystemAccount(sacc))
+
+	// Target account that will own the tracked response serviceImport.
+	acc, _ := createAccount(s)
+
+	// Construct the offending state directly: a response serviceImport with a
+	// .T-suffixed tracked reply, tracking enabled, but a nil latency.
+	reply := "_R_.abcdef.T"
+	si := &serviceImport{
+		acc:      acc,
+		from:     reply,
+		to:       reply,
+		response: true,
+		tracking: true, // tracking on, but...
+		latency:  nil,  // ...no latency object -> nil deref at si.latency.subject
+	}
+	acc.mu.Lock()
+	if acc.exports.responses == nil {
+		acc.exports.responses = make(map[string]*serviceImport)
+	}
+	acc.exports.responses[reply] = si
+	acc.mu.Unlock()
+
+	// Craft a remote latency measurement that resolves to this serviceImport.
+	rl := remoteLatency{
+		Account: acc.Name,
+		ReqId:   reply,
+	}
+	msg, err := json.Marshal(&rl)
+	require_NoError(t, err)
+
+	// On unfixed code this panics with a nil pointer dereference on
+	// si.latency.subject. With the fix it returns cleanly.
+	var recovered any
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				recovered = r
+				// The panic occurred while holding acc.mu.RLock() (taken just
+				// before the offending deref and released just after). Release
+				// it so the deferred s.Shutdown does not deadlock.
+				acc.mu.RUnlock()
+			}
+		}()
+		s.remoteLatencyUpdate(nil, nil, nil, "$SYS.LATENCY.M2."+reply, "", nil, msg)
+	}()
+
+	if recovered != nil {
+		t.Fatalf("remoteLatencyUpdate panicked on nil si.latency: %v", recovered)
 	}
 }
