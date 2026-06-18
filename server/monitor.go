@@ -550,18 +550,10 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		sort.Sort(sort.Reverse(SortByRTT{pconns}))
 	}
 
-	minoff := c.Offset
-	maxoff := c.Offset + c.Limit
-
-	maxIndex := totalClients
-
 	// Make sure these are sane.
-	if minoff > maxIndex {
-		minoff = maxIndex
-	}
-	if maxoff > maxIndex {
-		maxoff = maxIndex
-	}
+	maxIndex := totalClients
+	minoff := min(max(c.Offset, 0), maxIndex)
+	maxoff := minoff + min(c.Limit, maxIndex-minoff)
 
 	// Now pare down to the requested size.
 	// TODO(dlc) - for very large number of connections we
@@ -1087,18 +1079,10 @@ func (s *Server) Subsz(opts *SubszOptions) (*Subsz, error) {
 			sub.client.mu.Unlock()
 			i++
 		}
-		minoff := sz.Offset
-		maxoff := sz.Offset + sz.Limit
-
-		maxIndex := i
-
 		// Make sure these are sane.
-		if minoff > maxIndex {
-			minoff = maxIndex
-		}
-		if maxoff > maxIndex {
-			maxoff = maxIndex
-		}
+		maxIndex := i
+		minoff := min(max(sz.Offset, 0), maxIndex)
+		maxoff := minoff + min(sz.Limit, maxIndex-minoff)
 		sz.Subs = details[minoff:maxoff]
 		sz.Total = len(details)
 	} else {

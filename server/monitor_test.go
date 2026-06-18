@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -866,6 +867,34 @@ func TestMonitorConnzWithOffsetAndLimit(t *testing.T) {
 			t.Fatalf("Expected Total to be 2, got %v", c.Total)
 		}
 	}
+}
+
+func TestMonitorConnzOffsetOverflow(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// Need at least one open connection so we get past the empty-result early
+	// return and reach the pagination slicing.
+	cl := createClientConnSubscribeAndPublish(t, s)
+	defer cl.Close()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		// Offset = math.MaxInt64, Limit = 1 makes Offset+Limit overflow to math.MinInt64.
+		c := pollConnz(t, s, mode, url+fmt.Sprintf("connz?offset=%d&limit=1", math.MaxInt64),
+			&ConnzOptions{Offset: math.MaxInt64, Limit: 1})
+		if c.Conns == nil || len(c.Conns) != 0 {
+			t.Fatalf("Expected 0 connections in array, got %v\n", len(c.Conns))
+		}
+		if c.NumConns != 0 {
+			t.Fatalf("Expected NumConns to be 0, got %v", c.NumConns)
+		}
+	}
+
+	// Both Offset and Limit at the max also overflows the sum.
+	_, err := s.Connz(&ConnzOptions{Offset: math.MaxInt64, Limit: math.MaxInt64})
+	require_NoError(t, err)
 }
 
 func TestMonitorConnzDefaultSorted(t *testing.T) {
@@ -1729,6 +1758,37 @@ func TestMonitorSubszWithOffsetAndLimit(t *testing.T) {
 			t.Fatalf("Expected subscription details for 100 subs, got %d\n", len(sl.Subs))
 		}
 	}
+}
+
+func TestMonitorSubszOffsetOverflow(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	nc := createClientConnSubscribeAndPublish(t, s)
+	defer nc.Close()
+
+	_, err := nc.Subscribe("foo.*", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	_, err = nc.Subscribe("foo.bar", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	_, err = nc.Subscribe("foo.foo", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		// Offset = math.MaxInt64, Limit = 1 makes Offset+Limit overflow to math.MinInt64.
+		sl := pollSubsz(t, s, mode, url+fmt.Sprintf("subsz?subs=1&offset=%d&limit=1", math.MaxInt64),
+			&SubszOptions{Subscriptions: true, Offset: math.MaxInt64, Limit: 1})
+		if len(sl.Subs) != 0 {
+			t.Fatalf("Expected 0 subscription details, got %d", len(sl.Subs))
+		}
+	}
+
+	// Both Offset and Limit at the max also overflows the sum.
+	_, err = s.Subsz(&SubszOptions{Subscriptions: true, Offset: math.MaxInt64, Limit: math.MaxInt64})
+	require_NoError(t, err)
 }
 
 func TestMonitorSubszTestPubSubject(t *testing.T) {
