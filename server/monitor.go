@@ -2590,21 +2590,11 @@ func ResponseHandler(w http.ResponseWriter, r *http.Request, data []byte) {
 }
 
 // handleResponse handles responses for monitoring routes with a specific HTTP status code.
-func handleResponse(code int, w http.ResponseWriter, r *http.Request, data []byte) {
-	// Get callback from request
-	callback := r.URL.Query().Get("callback")
-	if callback != _EMPTY_ {
-		// Response for JSONP
-		w.Header().Set("Content-Type", "application/javascript")
-		w.WriteHeader(code)
-		fmt.Fprintf(w, "%s(%s)", callback, data)
-	} else {
-		// Otherwise JSON
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.WriteHeader(code)
-		w.Write(data)
-	}
+func handleResponse(code int, w http.ResponseWriter, _ *http.Request, data []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(code)
+	w.Write(data)
 }
 
 func (reason ClosedState) String() string {

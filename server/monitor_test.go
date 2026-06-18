@@ -187,7 +187,6 @@ func TestMonitorNoPort(t *testing.T) {
 
 var (
 	appJSONContent = "application/json"
-	appJSContent   = "application/javascript"
 	textPlain      = "text/plain; charset=utf-8"
 	textHTML       = "text/html; charset=utf-8"
 )
@@ -414,9 +413,6 @@ func TestMonitorHandleVarz(t *testing.T) {
 			t.Fatalf("Expected 1000 max_ha_assets got %q", v.JetStream.Limits.MaxHAAssets)
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"varz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func pollConnz(t *testing.T, s *Server, mode int, url string, opts *ConnzOptions) *Connz {
@@ -494,9 +490,6 @@ func TestMonitorConnz(t *testing.T) {
 		testConnz(mode)
 		checkClientsCount(t, s, 0)
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"connz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestMonitorConnzBadParams(t *testing.T) {
@@ -1577,9 +1570,6 @@ func TestMonitorConnzWithRoutes(t *testing.T) {
 			}
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"routez?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestMonitorRoutezWithBadParams(t *testing.T) {
@@ -1634,9 +1624,6 @@ func TestSubsz(t *testing.T) {
 			}
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"subsz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestSubszOperatorMode(t *testing.T) {
@@ -6418,50 +6405,13 @@ func TestMonitorAccountszMappingOrderReporting(t *testing.T) {
 	}
 }
 
-// createCallbackURL adds a callback query parameter for JSONP requests.
-func createCallbackURL(t *testing.T, endpoint string) string {
-	t.Helper()
-
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	params := u.Query()
-	params.Set("callback", "callback")
-
-	u.RawQuery = params.Encode()
-
-	return u.String()
-}
-
-// stripCallback removes the JSONP callback function from the response.
-// Returns the JSON body without the wrapping callback function.
-// If there's no callback function, the data is returned as is.
-func stripCallback(data []byte) []byte {
-	// Cut the JSONP callback function with the opening parentheses.
-	_, after, found := bytes.Cut(data, []byte("("))
-
-	if found {
-		return bytes.TrimSuffix(after, []byte(")"))
-	}
-
-	return data
-}
-
-// expectHealthStatus makes 1 regular and 1 JSONP request to the URL and checks the
-// HTTP status code, Content-Type header and health status string.
+// expectHealthStatus makes a request to the URL and checks the HTTP status code,
+// Content-Type header and health status string.
 func expectHealthStatus(t *testing.T, url string, statusCode int, wantStatus string) {
 	t.Helper()
 
-	// First check for regular requests.
 	body := readBodyEx(t, url, statusCode, appJSONContent)
 	checkHealthStatus(t, body, wantStatus)
-
-	// Another check for JSONP requests.
-	jsonpURL := createCallbackURL(t, url) // Adds a callback query param.
-	jsonpBody := readBodyEx(t, jsonpURL, statusCode, appJSContent)
-	checkHealthStatus(t, stripCallback(jsonpBody), wantStatus)
 }
 
 // checkHealthStatus checks the health status from a JSON response.
@@ -6755,11 +6705,7 @@ func TestServerHealthz(t *testing.T) {
 // Benchmark our Connz generation. Don't use HTTP here, just measure server endpoint.
 // Helper function to check that a JS cluster is formed
 // https://github.com/nats-io/nats-server/issues/4144
-// createCallbackURL adds a callback query parameter for JSONP requests.
-// stripCallback removes the JSONP callback function from the response.
-// Returns the JSON body without the wrapping callback function.
-// If there's no callback function, the data is returned as is.
-// expectHealthStatus makes 1 regular and 1 JSONP request to the URL and checks the
+// expectHealthStatus makes a request to the URL and checks the
 // HTTP status code, Content-Type header and health status string.
 // checkHealthStatus checks the health status from a JSON response.
 // checkHealthzEndpoint makes requests to the /healthz endpoint and checks the health status.
