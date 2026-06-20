@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +194,31 @@ func TestCreateMakesDir(t *testing.T) {
 
 	_, err = os.Stat(fullPath)
 	require_NoError(t, err)
+}
+
+func TestDirStoreInaccessibleParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not block traversal on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission checks")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "parent")
+	require_NoError(t, os.Mkdir(parent, 0o755))
+	child := filepath.Join(parent, "child")
+	require_NoError(t, os.Mkdir(child, 0o755))
+
+	// Remove the search bit on the parent so stat of child returns EACCES
+	// rather than IsNotExist. Previously this panicked with a nil pointer
+	// dereference instead of returning an error.
+	require_NoError(t, os.Chmod(parent, 0o000))
+	t.Cleanup(func() { os.Chmod(parent, 0o755) })
+
+	_, err := NewDirJWTStore(child, false, true)
+	require_Error(t, err)
 }
 
 func TestShardedDirStorePackMerge(t *testing.T) {
