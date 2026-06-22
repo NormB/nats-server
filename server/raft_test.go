@@ -1372,6 +1372,15 @@ func TestNRGTruncateWALRevertsUncommittedAddPeer(t *testing.T) {
 		require_Equal(t, n.membChange.peer, newPeer)
 		require_True(t, n.membChange.prev == nil)
 
+		// Raftz should report the new peer as not known/committed yet.
+		rz := n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz := (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 2)
+		require_True(t, gz.Peers[nats0].Known)
+		require_False(t, gz.Peers[newPeer].Known)
+
 		// Truncate the uncommitted AddPeer entry. Its speculative effects must be reverted.
 		n.truncateWAL(1, 1)
 		require_Equal(t, n.pindex, 1)
@@ -1380,6 +1389,14 @@ func TestNRGTruncateWALRevertsUncommittedAddPeer(t *testing.T) {
 		require_Equal(t, n.csz, 2)
 		require_Equal(t, n.qn, 2)
 		require_True(t, n.membChange == nil)
+
+		// Raftz should also be reverted.
+		rz = n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz = (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 1)
+		require_True(t, gz.Peers[nats0].Known)
 	}
 
 	t.Run("Leader", func(t *testing.T) { test(KindLeader) })
@@ -1434,6 +1451,14 @@ func TestNRGTruncateWALRevertsUncommittedRemovePeer(t *testing.T) {
 		require_Equal(t, n.membChange.peer, oldPeer)
 		require_NotNil(t, n.membChange.prev)
 
+		// Raftz shouldn't report the to-be-removed peer anymore.
+		rz := n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz := (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 1)
+		require_True(t, gz.Peers[nats0].Known)
+
 		// Truncate the uncommitted RemovePeer entry. Its speculative effects must be reverted.
 		n.truncateWAL(1, 1)
 		_, ok = n.peers[oldPeer]
@@ -1443,6 +1468,15 @@ func TestNRGTruncateWALRevertsUncommittedRemovePeer(t *testing.T) {
 		_, ok = n.removed[oldPeer]
 		require_False(t, ok)
 		require_True(t, n.membChange == nil)
+
+		// Raftz should also be reverted.
+		rz = n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz = (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 2)
+		require_True(t, gz.Peers[nats0].Known)
+		require_True(t, gz.Peers[oldPeer].Known)
 	}
 
 	t.Run("Leader", func(t *testing.T) { test(KindLeader) })
@@ -4318,9 +4352,6 @@ func TestNRGQuorumAfterLeaderStepdown(t *testing.T) {
 	require_NoError(t, n.trackPeer(nats1))
 	require_True(t, n.Quorum())
 	require_Len(t, len(n.peers), 3)
-	for _, ps := range n.peers {
-		ps.kp = true
-	}
 
 	// If we hand off leadership to another server, we should
 	// still be reporting we have quorum.
@@ -6522,7 +6553,7 @@ func TestNRGReset(t *testing.T) {
 
 	// Add another peer in addition to ourselves.
 	other := nats1
-	n.peers[other] = &lps{time.Time{}, 0, true}
+	n.peers[other] = &lps{time.Time{}, 0}
 	n.adjustClusterSizeAndQuorum()
 	n.updateLeader(other)
 
