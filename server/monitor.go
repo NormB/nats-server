@@ -4224,9 +4224,10 @@ func (s *Server) Raftz(opts *RaftzOptions) *RaftzStatus {
 			if id == n.id {
 				continue
 			}
+			kp := n.membChange == nil || n.membChange.peer != id
 			peer := RaftzGroupPeer{
 				Name:                s.serverNameForNode(id),
-				Known:               p.kp,
+				Known:               kp,
 				LastReplicatedIndex: p.li,
 			}
 			if !p.ts.IsZero() {
