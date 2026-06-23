@@ -1388,8 +1388,8 @@ func (n *raft) createSnapshotCheckpointLocked(force bool) (*checkpoint, error) {
 		return nil, errNoSnapAvailable
 	}
 
-	// Snapshot the current peer state for the current applied index, we'll need it in the snapshot.
-	peerstate := encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
+	// Snapshot the committed peer state for the current applied index, we'll need it in the snapshot.
+	peerstate := encodePeerState(n.committedPeerStateLocked(n.applied))
 	snapDir := filepath.Join(n.sd, snapshotsDir)
 	snapFile := filepath.Join(snapDir, fmt.Sprintf(snapFileT, term, n.applied))
 
@@ -3561,7 +3561,7 @@ func (n *raft) applyCommit(index uint64) error {
 				n.installSnapshot(&snapshot{
 					lastTerm:  ae.pterm,
 					lastIndex: ae.commit,
-					peerstate: encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt}),
+					peerstate: encodePeerState(n.committedPeerStateLocked(ae.commit)),
 					data:      e.Data,
 				})
 			}
@@ -4767,6 +4767,39 @@ func (n *raft) currentPeerState() *peerState {
 
 func (n *raft) currentPeerStateLocked() *peerState {
 	return &peerState{n.peerNames(), n.csz, n.extSt}
+}
+
+// committedPeerStateLocked builds peer state from the committed membership as of the given index.
+// Lock should be held.
+func (n *raft) committedPeerStateLocked(index uint64) *peerState {
+	// No pending change or index already covers the pending change.
+	if n.membChange == nil || n.membChange.index <= index {
+		return &peerState{n.peerNames(), n.csz, n.extSt}
+	}
+
+	// Reconstruct the committed peer set by reverting the speculative change.
+	peer := n.membChange.peer
+	if n.membChange.prev != nil {
+		// This was a removal; the peer is still a committed member, add it back.
+		names := make([]string, 0, len(n.peers)+1)
+		for name := range n.peers {
+			names = append(names, name)
+		}
+		if _, ok := n.peers[peer]; !ok {
+			names = append(names, peer)
+		}
+		return &peerState{names, len(names), n.extSt}
+	}
+
+	// This was an addition; exclude the not-yet-committed peer.
+	names := make([]string, 0, len(n.peers))
+	for name := range n.peers {
+		if name == peer {
+			continue
+		}
+		names = append(names, name)
+	}
+	return &peerState{names, len(names), n.extSt}
 }
 
 // sendPeerState will send our current peer state to the cluster.
