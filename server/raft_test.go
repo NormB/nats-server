@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -6028,6 +6029,93 @@ func TestNRGReplayAddPeerKeepsClusterSize(t *testing.T) {
 	n.Stop()
 	n.WaitForStop()
 	fs.Stop()
+}
+
+func TestNRGSnapshotExcludesUncommittedMembershipChange(t *testing.T) {
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+
+	t.Run("AddPeer", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		newPeer := "yrzKKRBu" // "nats-1"
+
+		n.Lock()
+		n.addPeer(nats0)
+		n.Unlock()
+		require_Equal(t, len(n.peers), 2)
+
+		aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+		aeAddPeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryAddPeer, []byte(newPeer))}})
+		n.processAppendEntry(aeMsg, n.aesub)
+		n.processAppendEntry(aeAddPeer, n.aesub)
+
+		// The peer is tracked speculatively and the change is inflight at index 2.
+		require_Equal(t, n.commit, 1)
+		_, ok := n.peers[newPeer]
+		require_True(t, ok)
+		require_Equal(t, n.csz, 3)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+
+		// Apply the committed normal entry, then snapshot at applied (index 1).
+		n.Applied(1)
+		require_NoError(t, n.InstallSnapshot(nil, false))
+
+		// The snapshot's peer state must reflect committed membership only,
+		// i.e. it must not contain the not-yet-committed peer.
+		snap, err := n.loadLastSnapshot()
+		require_NoError(t, err)
+		require_Equal(t, snap.lastIndex, 1)
+		ps, err := decodePeerState(snap.peerstate)
+		require_NoError(t, err)
+		require_Equal(t, ps.clusterSize, 2)
+		require_Len(t, len(ps.knownPeers), 2)
+		require_False(t, slices.Contains(ps.knownPeers, newPeer))
+	})
+
+	t.Run("RemovePeer", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		oldPeer := "yrzKKRBu" // "nats-1"
+
+		n.Lock()
+		n.addPeer(nats0)
+		n.addPeer(oldPeer)
+		n.Unlock()
+		require_Equal(t, len(n.peers), 3)
+
+		aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+		aeRemovePeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(oldPeer))}})
+		n.processAppendEntry(aeMsg, n.aesub)
+		n.processAppendEntry(aeRemovePeer, n.aesub)
+
+		// The peer is removed speculatively and the change is inflight at index 2.
+		require_Equal(t, n.commit, 1)
+		_, ok := n.peers[oldPeer]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+
+		// Apply the committed normal entry, then snapshot at applied (index 1).
+		n.Applied(1)
+		require_NoError(t, n.InstallSnapshot(nil, false))
+
+		// The snapshot's peer state must reflect committed membership only,
+		// i.e. it must still include the not-yet-removed peer.
+		snap, err := n.loadLastSnapshot()
+		require_NoError(t, err)
+		require_Equal(t, snap.lastIndex, 1)
+		ps, err := decodePeerState(snap.peerstate)
+		require_NoError(t, err)
+		require_Equal(t, ps.clusterSize, 3)
+		require_Len(t, len(ps.knownPeers), 3)
+		require_True(t, slices.Contains(ps.knownPeers, oldPeer))
+	})
 }
 
 func TestNRGTrackPeerLag(t *testing.T) {
