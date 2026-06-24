@@ -5296,6 +5296,13 @@ func (n *raft) switchToCandidate() {
 		return
 	}
 
+	// Do not campaign with an uncommitted membership change about us,
+	// otherwise we would try to become leader outside our peer set.
+	if n.membChange != nil && n.membChange.peer == n.id {
+		n.resetElect(minElectionTimeout)
+		return
+	}
+
 	if n.State() != Candidate {
 		n.debug("Switching to candidate")
 	} else {

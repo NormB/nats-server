@@ -5932,6 +5932,53 @@ func TestNRGSnapshotExcludesUncommittedMembershipChange(t *testing.T) {
 	})
 }
 
+func TestNRGDontSwitchToCandidateWithInflightSelfMembershipChange(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	n.Lock()
+	n.addPeer(nats0)
+	n.addPeer(nats1)
+	n.Unlock()
+	require_Equal(t, len(n.peers), 3)
+
+	// Receive an uncommitted EntryRemovePeer that targets us.
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+	aeRemoveSelf := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(n.id))}})
+	n.processAppendEntry(aeMsg, n.aesub)
+	n.processAppendEntry(aeRemoveSelf, n.aesub)
+
+	// We've speculatively removed ourselves, and the change is inflight at index 2.
+	_, ok := n.peers[n.id]
+	require_False(t, ok)
+	require_NotNil(t, n.membChange)
+	require_Equal(t, n.membChange.peer, n.id)
+	require_Equal(t, n.membChange.index, 2)
+
+	// We must not become a candidate while our own removal is uncommitted.
+	n.Applied(1)
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+
+	// Truncate the uncommitted removal back to the committed index. This
+	// restores us to our own peer set and clears the inflight change.
+	n.Lock()
+	n.truncateWAL(1, 1)
+	n.Unlock()
+	_, ok = n.peers[n.id]
+	require_True(t, ok)
+	require_True(t, n.membChange == nil)
+
+	// Now that we're a settled member again, we can campaign.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+}
+
 func TestNRGTrackPeerLag(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
