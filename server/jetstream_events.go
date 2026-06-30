@@ -46,10 +46,16 @@ func (s *Server) jsAdvisoriesForwarded(accName string) bool {
 
 // forwardJSAdvisoryToSysAcct mirrors an already-encoded advisory payload into the
 // system account, namespaced by the originating account name so a system
-// operator can observe advisories across all accounts. Callers should gate on
-// jsAdvisoriesForwarded first. The payload is copied because the system send
-// queue delivers it asynchronously and the caller's buffer may be reused.
+// operator can observe advisories across all accounts. Only advisory/metric
+// subjects are forwarded; the subject guard keeps the invariant local so a future
+// caller cannot inadvertently leak non-advisory traffic into the system account.
+// Callers should gate on jsAdvisoriesForwarded first. The payload is copied
+// because the system send queue delivers it asynchronously and the caller's
+// buffer may be reused.
 func (s *Server) forwardJSAdvisoryToSysAcct(accName, subject string, payload []byte) {
+	if !isJSAdvisoryOrMetricSubject(subject) {
+		return
+	}
 	sysAcc := s.SystemAccount()
 	if sysAcc == nil {
 		return
@@ -61,8 +67,12 @@ func (s *Server) forwardJSAdvisoryToSysAcct(accName, subject string, payload []b
 	}
 }
 
-// publishAdvisory sends the given advisory into the account. Returns true if
-// it was sent, false if not (i.e. due to lack of interest or a marshal error).
+// publishAdvisory marshals adv and delivers it to the originating account (when
+// it has local interest) and/or mirrors it into the system account (when
+// forwarding is enabled). It returns false on a marshal error, when there is
+// neither local interest nor forwarding, or when the originating-account send
+// fails; the success of a system-account forward is logged but not reflected in
+// the return value.
 func (s *Server) publishAdvisory(acc *Account, subject string, adv any) bool {
 	if acc == nil {
 		acc = s.SystemAccount()
