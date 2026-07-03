@@ -4260,10 +4260,13 @@ func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, _ *Accoun
 		})
 
 		// Now do the real streaming.
-		s.streamSnapshot(acc, mset, sr, &req)
-
+		err = s.streamSnapshot(acc, mset, sr, &req)
 		end := time.Now().UTC()
 
+		var errStr string
+		if err != nil {
+			errStr = err.Error()
+		}
 		s.publishAdvisory(acc, JSAdvisoryStreamSnapshotCompletePre+"."+mset.name(), &JSSnapshotCompleteAdvisory{
 			TypedEvent: TypedEvent{
 				Type: JSSnapshotCompleteAdvisoryType,
@@ -4275,9 +4278,10 @@ func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, _ *Accoun
 			End:    end,
 			Client: ci.forAdvisory(),
 			Domain: s.getOpts().JetStreamDomain,
+			Error:  errStr,
 		})
 
-		if err := <-sr.errCh; err != _EMPTY_ {
+		if err != nil {
 			s.Warnf("Snapshot for stream '%s > %s' failed after %v: %s",
 				mset.jsa.account.Name,
 				mset.name(),
@@ -4303,7 +4307,7 @@ const defaultSnapshotAckTimeout = 5 * time.Second
 var snapshotAckTimeout = defaultSnapshotAckTimeout
 
 // streamSnapshot will stream out our snapshot to the reply subject.
-func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, req *JSApiStreamSnapshotRequest) {
+func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, req *JSApiStreamSnapshotRequest) error {
 	chunkSize, wndSize := req.ChunkSize, req.WindowSize
 	if chunkSize == 0 {
 		chunkSize = defaultSnapshotChunkSize
@@ -4358,6 +4362,8 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 
 	var hdr []byte
 	chunk := make([]byte, chunkSize)
+	errCh := sr.errCh
+	var snapshotErr error
 	ackTimer := time.NewTimer(snapshotAckTimeout)
 	defer stopAndClearTimer(&ackTimer)
 	// index only incremented when a chunk is actually being sent.
@@ -4367,20 +4373,23 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 			// A slot has become available.
 		case <-inch:
 			// The receiver appears to have gone away.
+			snapshotErr = errors.New("no interest")
 			hdr = []byte("NATS/1.0 408 No Interest\r\n\r\n")
 			goto done
-		case err, ok := <-sr.errCh:
+		case err, ok := <-errCh:
 			if !ok {
 				// Channel closed normally, e.g. on completion.
-				sr.errCh = nil
+				errCh = nil
 				continue
 			}
 			// The snapshotting goroutine has failed for some reason.
-			hdr = []byte(fmt.Sprintf("NATS/1.0 500 %s\r\n\r\n", err))
+			snapshotErr = err
+			hdr = fmt.Appendf(nil, "NATS/1.0 500 %s\r\n\r\n", err)
 			goto done
 		case <-ackTimer.C:
 			// It's taking a very long time for the receiver to send us acks,
 			// they have probably stalled or there is high loss on the link.
+			snapshotErr = errors.New("no flow response")
 			hdr = []byte("NATS/1.0 408 No Flow Response\r\n\r\n")
 			goto done
 		}
@@ -4389,6 +4398,14 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 		if err != nil {
 			if n > 0 {
 				mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, nil, chunk, nil, 0))
+			}
+			select {
+			case err, ok := <-errCh:
+				if ok {
+					snapshotErr = err
+					hdr = fmt.Appendf(nil, "NATS/1.0 500 %s\r\n\r\n", err)
+				}
+			default:
 			}
 			break
 		}
@@ -4403,6 +4420,7 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 
 done:
 	mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+	return snapshotErr
 }
 
 // For determining consumer request type.

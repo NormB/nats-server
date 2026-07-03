@@ -15,6 +15,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -47,14 +48,14 @@ func (js *jetStream) CreateStreamSnapshotV2(store StreamStore, deadline time.Dur
 	store.FastState(&state)
 
 	// Stream in separate Go routine.
-	errCh := make(chan string, 1)
+	errCh := make(chan error, 1)
 	go js.streamSnapshotV2(store, &state, pw, includeConsumers, sa, errCh)
 
 	return &SnapshotResult{pr, state, errCh}, nil
 }
 
 // Stream our snapshot through S2 compression and the custom archive format.
-func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w io.WriteCloser, includeConsumers bool, sa *streamAssignment, errCh chan string) {
+func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w io.WriteCloser, includeConsumers bool, sa *streamAssignment, errCh chan error) {
 	defer close(errCh)
 	defer w.Close()
 
@@ -121,7 +122,7 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		streamState.Consumers = 0
 	} else if clustered {
 		if sa == nil {
-			errCh <- "stream assignment not present in clustered mode"
+			errCh <- errors.New("stream assignment not present in clustered mode")
 			return
 		}
 		js.mu.RLock()
@@ -138,11 +139,11 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 
 	ssj, err := json.Marshal(streamState)
 	if err != nil {
-		errCh <- err.Error()
+		errCh <- err
 		return
 	}
 	if err := writeGeneric("state.json", now.UnixNano(), 0, 0, int64(len(ssj)), ssj); err != nil {
-		errCh <- err.Error()
+		errCh <- err
 		return
 	}
 
@@ -192,14 +193,14 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 			for _, ca := range consumerAssignments {
 				ci, err := sysRequest[ConsumerInfo](js.srv, clusterConsumerInfoT, sa.Client.serviceAccount(), sa.Config.Name, ca.Name)
 				if err != nil || ci == nil {
-					errCh <- fmt.Sprintf("failed to get consumer state for '%s > %s'", sa.Config.Name, ca.Name)
+					errCh <- fmt.Errorf("failed to get consumer state for '%s > %s'", sa.Config.Name, ca.Name)
 					return
 				}
 				if err := writeConsumerMsg(SnapshotConsumerState{
 					ConsumerConfig: ca.Config,
 					ConsumerState:  consumerStateFromInfo(ci),
 				}); err != nil {
-					errCh <- err.Error()
+					errCh <- err
 					return
 				}
 			}
@@ -208,14 +209,14 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 				config := o.GetConfig()
 				state, err := o.State()
 				if err != nil {
-					errCh <- fmt.Sprintf("couldn't load consumer '%s' state: %s", config.Name, err)
+					errCh <- fmt.Errorf("couldn't load consumer '%s' state: %s", config.Name, err)
 					return
 				}
 				if err := writeConsumerMsg(SnapshotConsumerState{
 					ConsumerConfig: config,
 					ConsumerState:  state,
 				}); err != nil {
-					errCh <- err.Error()
+					errCh <- err
 					return
 				}
 			}
@@ -228,11 +229,11 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 			if err == ErrStoreEOF {
 				break
 			}
-			errCh <- fmt.Sprintf("couldn't load next message after seq %d: %s", seq+1, err)
+			errCh <- fmt.Errorf("couldn't load next message after seq %d: %s", seq+1, err)
 			return
 		}
 		if err = writeStoreMsg(&sm); err != nil {
-			errCh <- err.Error()
+			errCh <- err
 			return
 		}
 	}
@@ -242,7 +243,7 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	// messages or from first/last sequence, which may not be possible
 	// during the rewrite of a large stream backup.
 	if err = writeGeneric(_EMPTY_, 0, 0, 0, 0, nil); err != nil {
-		errCh <- err.Error()
+		errCh <- err
 	}
 }
 
