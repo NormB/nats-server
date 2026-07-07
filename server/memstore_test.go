@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"slices"
@@ -1262,6 +1263,129 @@ func TestMemStoreSubjectDeleteMarkers(t *testing.T) {
 	im := require_ChanRead(t, ch, time.Second*5)
 	require_Equal(t, bytesToString(getHeader(JSMarkerReason, im.hdr)), JSMarkerReasonMaxAge)
 	require_Equal(t, bytesToString(getHeader(JSMessageTTL, im.hdr)), "1s")
+}
+
+func TestMemStoreSubjectDeleteMarkerReplacedOnPublish(t *testing.T) {
+	ms, err := newMemStore(
+		&StreamConfig{
+			Name: "zzz", Subjects: []string{"test"}, Storage: MemoryStorage,
+			MaxMsgsPer: 5, AllowMsgTTL: true,
+			SubjectDeleteMarkerTTL: 2 * time.Second,
+		},
+	)
+	require_NoError(t, err)
+	defer ms.Stop()
+
+	ms.rmcb = func(seq uint64) { ms.RemoveMsg(seq) }
+	ms.pmsgcb = func(im *inMsg) {}
+
+	// A subject topped by a marker -- the post-rollup state after a key
+	// died (markers are placed via rollup, so they sit alone on the
+	// subject).
+	hdr := fmt.Appendf(nil, "NATS/1.0\r\n%s: %s\r\n%s: %s\r\n\r\n",
+		JSMarkerReason, JSMarkerReasonMaxAge, JSMessageTTL, "2s")
+	mseq, _, err := ms.StoreMsg("test", hdr, nil, 2)
+	require_NoError(t, err)
+
+	// The marker must be tracked at store time.
+	ms.mu.RLock()
+	tracked := ms.sdm != nil && ms.sdm.markers["test"] == mseq
+	ms.mu.RUnlock()
+	require_True(t, tracked)
+
+	// Storing a real message over it must remove the stale marker NOW
+	// (like MaxMsgsPer=1 displacement does), not at the marker's own TTL.
+	seq, _, err := ms.StoreMsg("test", nil, []byte("live"), 0)
+	require_NoError(t, err)
+
+	var smv StoreMsg
+	_, err = ms.LoadMsg(mseq, &smv)
+	require_Error(t, err)
+
+	var ss StreamState
+	ms.FastState(&ss)
+	require_Equal(t, ss.Msgs, 1)
+	require_Equal(t, ss.FirstSeq, seq)
+
+	// No orphaned tracking entry.
+	ms.mu.RLock()
+	n := len(ms.sdm.markers)
+	ms.mu.RUnlock()
+	require_Equal(t, n, 0)
+}
+
+func TestMemStoreSubjectDeleteMarkerTrackingNoLeaks(t *testing.T) {
+	ms, err := newMemStore(
+		&StreamConfig{
+			Name: "zzz", Subjects: []string{"test"}, Storage: MemoryStorage,
+			MaxMsgsPer: 5, AllowMsgTTL: true,
+			SubjectDeleteMarkerTTL: time.Second,
+		},
+	)
+	require_NoError(t, err)
+	defer ms.Stop()
+
+	ms.rmcb = func(seq uint64) { ms.RemoveMsg(seq) }
+	ms.pmsgcb = func(im *inMsg) {}
+
+	markerHdr := fmt.Appendf(nil, "NATS/1.0\r\n%s: %s\r\n%s: %s\r\n\r\n",
+		JSMarkerReason, JSMarkerReasonMaxAge, JSMessageTTL, "1s")
+
+	trackedMarkers := func() int {
+		ms.mu.RLock()
+		defer ms.mu.RUnlock()
+		if ms.sdm == nil {
+			return 0
+		}
+		return len(ms.sdm.markers)
+	}
+
+	// Exit 1: the marker self-expires via its own TTL.  The tracking
+	// entry, the message, and its TTL-wheel entry must all be gone.
+	_, _, err = ms.StoreMsg("test", markerHdr, nil, 1)
+	require_NoError(t, err)
+	require_Equal(t, trackedMarkers(), 1)
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		var ss StreamState
+		ms.FastState(&ss)
+		if ss.Msgs != 0 {
+			return fmt.Errorf("marker still present: %d msgs", ss.Msgs)
+		}
+		return nil
+	})
+	require_Equal(t, trackedMarkers(), 0)
+	var ss StreamState
+	ms.FastState(&ss)
+	require_Equal(t, ss.NumDeleted, 0)
+	// The TTL-wheel entry of a removed message is dropped by the next
+	// age-check cycle (the drain calls ttls.Remove when it finds the
+	// message gone), so assert eventually-empty rather than immediate.
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		ms.mu.RLock()
+		nextTTL := ms.ttls.GetNextExpiration(math.MaxInt64)
+		ms.mu.RUnlock()
+		if nextTTL != math.MaxInt64 {
+			return fmt.Errorf("TTL wheel not drained: next %d", nextTTL)
+		}
+		return nil
+	})
+
+	// Exit 2: bulk purge clears the tracking wholesale.
+	_, _, err = ms.StoreMsg("test", markerHdr, nil, 1)
+	require_NoError(t, err)
+	require_Equal(t, trackedMarkers(), 1)
+	_, err = ms.Purge()
+	require_NoError(t, err)
+	require_Equal(t, trackedMarkers(), 0)
+
+	// Exit 3: any direct removal (limits/MaxAge paths funnel through the
+	// same per-subject accounting) cleans the entry.
+	mseq, _, err := ms.StoreMsg("test", markerHdr, nil, 1)
+	require_NoError(t, err)
+	require_Equal(t, trackedMarkers(), 1)
+	_, err = ms.RemoveMsg(mseq)
+	require_NoError(t, err)
+	require_Equal(t, trackedMarkers(), 0)
 }
 
 func TestMemStoreAllLastSeqs(t *testing.T) {

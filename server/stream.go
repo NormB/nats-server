@@ -6962,16 +6962,14 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		return err
 	}
 
-	// If subject delete markers are used, ensure message TTL is that at minimum.
-	// Otherwise, subject delete markers could be missed if one already exists for this subject.
-	// MaxMsgsPer=1 is an exception, because we'll only ever have one message.
-	if ttl > 0 && mset.cfg.SubjectDeleteMarkerTTL > 0 && mset.cfg.MaxMsgsPer != 1 {
-		if minTtl := int64(mset.cfg.SubjectDeleteMarkerTTL.Seconds()); ttl < minTtl {
-			ttl = minTtl
-			hdr = removeHeaderIfPresent(hdr, JSMessageTTL)
-			hdr = genHeader(hdr, JSMessageTTL, strconv.FormatInt(ttl, 10))
-		}
-	}
+	// Per-message TTLs are honored as written, even below the subject
+	// delete marker TTL.  A message can therefore never expire while a
+	// stale marker sits on its subject: the stores remove a tracked
+	// marker the moment a real message lands over it (the MaxMsgsPer=1
+	// displacement behavior, generalized -- see the subject delete marker
+	// bookkeeping in storeRawMsg), which keeps the count-based
+	// last-of-subject decision at expiry exact and guarantees a fresh
+	// marker for every subject-emptying deletion.
 
 	// Store actual msg.
 	if lseq == 0 && ts == 0 {

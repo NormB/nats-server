@@ -294,6 +294,27 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 	ms.enforceMsgLimit()
 	ms.enforceBytesLimit()
 
+	// Subject delete marker bookkeeping: track a stored marker; storing a
+	// real message over a tracked (stale) marker removes the marker right
+	// away -- the MaxMsgsPer=1 displacement behavior generalized -- so a
+	// marker never coexists with live data and the count-based
+	// last-of-subject decision at expiry stays exact.  Local and
+	// deterministic: every replica does this at the same apply point.
+	if ms.cfg.SubjectDeleteMarkerTTL > 0 {
+		if len(hdr) > 0 && isSubjectDeleteMarker(hdr) {
+			if ms.sdm == nil {
+				ms.sdm = newSDMMeta()
+			}
+			ms.sdm.trackMarker(subj, seq)
+		} else if mseq, ok := ms.sdm.markerFor(subj); ok && mseq < seq {
+			// Removal funnels through removeSeqPerSubject, which drops
+			// the tracking entry; a failed removal means the marker is
+			// already gone, so drop the entry regardless.
+			ms.removeMsg(mseq, false)
+			ms.sdm.removeSeqAndSubject(mseq, subj)
+		}
+	}
+
 	// Per-message TTL.
 	if ms.ttls != nil && ttl > 0 {
 		expires := time.Duration(ts) + (time.Second * time.Duration(ttl))

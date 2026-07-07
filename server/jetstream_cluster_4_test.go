@@ -6376,7 +6376,124 @@ func TestJetStreamClusterParallelCreateRaftGroupHAAssetsLimit(t *testing.T) {
 	require_True(t, got <= maxAssets)
 }
 
-func TestJetStreamClusterSubjectDeleteMarkersMinimumTTL(t *testing.T) {
+func TestJetStreamClusterSubjectDeleteMarkersTTLPrecise(t *testing.T) {
+	// Per-message TTLs are honored as written -- no clamping to
+	// SubjectDeleteMarkerTTL -- because a stale subject delete marker is
+	// removed the moment a real message is stored over it (the
+	// MaxMsgsPer=1 displacement behavior, generalized).  This replaces
+	// the previous MinimumTTL semantics.
+	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
+		for _, replicas := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/R%d", storageType, replicas), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+
+				_, err := jsStreamCreate(t, nc, &StreamConfig{
+					Name:                   "TEST",
+					Retention:              LimitsPolicy,
+					Subjects:               []string{"foo", "bar"},
+					Replicas:               replicas,
+					Storage:                storageType,
+					SubjectDeleteMarkerTTL: 3 * time.Second,
+					AllowMsgTTL:            true,
+					MaxMsgsPer:             5,
+				})
+				require_NoError(t, err)
+
+				m := nats.NewMsg("foo")
+				m.Header.Set(JSMessageTTL, "1s")
+				_, err = js.PublishMsg(m)
+				require_NoError(t, err)
+
+				// The stored TTL header must be exactly what was published.
+				rsm, err := js.GetMsg("TEST", 1)
+				require_NoError(t, err)
+				require_Equal(t, rsm.Header.Get(JSMessageTTL), "1s")
+
+				// The message expires on ITS OWN TTL, and a marker is placed.
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", 1)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				sm, err := js.GetMsg("TEST", 2)
+				require_NoError(t, err)
+				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
+				require_Equal(t, sm.Subject, "foo")
+
+				// Publishing while the marker is still alive must REMOVE the
+				// stale marker immediately (not wait for its TTL).
+				pa, err := js.PublishMsg(m)
+				require_NoError(t, err)
+				require_Equal(t, pa.Sequence, 3)
+
+				checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+					if _, err := js.GetMsg("TEST", 2); err == nil {
+						return fmt.Errorf("stale marker still present")
+					}
+					return nil
+				})
+
+				// The new message expires on its own TTL too, and a FRESH
+				// marker is placed -- the scenario the old ingest clamp
+				// existed to protect.
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", 3)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				sm, err = js.GetMsg("TEST", 4)
+				require_NoError(t, err)
+				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
+				require_Equal(t, sm.Subject, "foo")
+
+				// Rollback case: when OLDER LIVE DATA remains on the subject,
+				// an expiring message must not leave a marker; the head
+				// simply rolls back to the previous revision.
+				_, err = js.Publish("bar", []byte("live"))
+				require_NoError(t, err)
+				bm := nats.NewMsg("bar")
+				bm.Header.Set(JSMessageTTL, "1s")
+				pab, err := js.PublishMsg(bm)
+				require_NoError(t, err)
+
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", pab.Sequence)
+				require_Error(t, err, nats.ErrMsgNotFound)
+				lm, err := js.GetLastMsg("TEST", "bar")
+				require_NoError(t, err)
+				require_Equal(t, lm.Header.Get(JSMarkerReason), _EMPTY_)
+				require_Equal(t, string(lm.Data), "live")
+
+				// Leak sweep: once the last marker's own TTL passes, nothing
+				// may be left behind on foo -- no orphan markers, no orphan
+				// data, no stuck subjects.
+				checkFor(t, 6*time.Second, 200*time.Millisecond, func() error {
+					si, err := js.StreamInfo("TEST")
+					if err != nil {
+						return err
+					}
+					// Only bar's live revision may remain.
+					if si.State.Msgs != 1 {
+						return fmt.Errorf("expected 1 msg (bar live), got %d", si.State.Msgs)
+					}
+					if si.State.NumSubjects != 1 {
+						return fmt.Errorf("expected 1 subject, got %d", si.State.NumSubjects)
+					}
+					return nil
+				})
+			})
+		}
+	}
+}
+
+func TestJetStreamClusterSubjectDeleteMarkersMaxAgeBelowMarker(t *testing.T) {
+	// MaxAge was never clamped against SubjectDeleteMarkerTTL, so before
+	// stale-marker replacement a message age-expiring while a marker was
+	// still alive produced NO fresh marker (silent key death for
+	// watchers).  With replacement the marker cannot coexist with the
+	// message in the first place.
 	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
 		for _, replicas := range []int{1, 3} {
 			t.Run(fmt.Sprintf("%s/R%d", storageType, replicas), func(t *testing.T) {
@@ -6394,52 +6511,57 @@ func TestJetStreamClusterSubjectDeleteMarkersMinimumTTL(t *testing.T) {
 					Storage:                storageType,
 					SubjectDeleteMarkerTTL: 3 * time.Second,
 					AllowMsgTTL:            true,
+					MaxMsgsPer:             5,
+					MaxAge:                 time.Second,
 				})
 				require_NoError(t, err)
 
-				m := nats.NewMsg("foo")
-				m.Header.Set(JSMessageTTL, "1s")
-				_, err = js.PublishMsg(m)
+				// First message age-expires and yields a marker.
+				_, err = js.Publish("foo", []byte("one"))
 				require_NoError(t, err)
 
-				_, err = js.GetMsg("TEST", 1)
+				var markerSeq uint64
+				checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+					sm, err := js.GetLastMsg("TEST", "foo")
+					if err != nil {
+						return err
+					}
+					if sm.Header.Get(JSMarkerReason) != JSMarkerReasonMaxAge {
+						return fmt.Errorf("no marker yet (seq %d)", sm.Sequence)
+					}
+					markerSeq = sm.Sequence
+					return nil
+				})
+
+				// Publish again while the marker is still alive: the stale
+				// marker must be removed at store time.
+				pa, err := js.Publish("foo", []byte("two"))
 				require_NoError(t, err)
+				checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+					if _, err := js.GetMsg("TEST", markerSeq); err == nil {
+						return fmt.Errorf("stale marker still present")
+					}
+					return nil
+				})
 
-				// After the TTL expires it should still be there, because SubjectDeleteMarkerTTL is the minimum.
-				time.Sleep(1500 * time.Millisecond)
-				rsm, err := js.GetMsg("TEST", 1)
-				require_NoError(t, err)
-				require_Equal(t, rsm.Header.Get(JSMessageTTL), "3") // 3s from the SDM TTL.
-
-				// Need to wait for the subject delete marker to be placed.
-				time.Sleep(2 * time.Second)
-
-				_, err = js.GetMsg("TEST", 1)
-				require_Error(t, err, nats.ErrMsgNotFound)
-
-				// Expect a subject delete marker based on per-message TTL.
-				sm, err := js.GetMsg("TEST", 2)
-				require_NoError(t, err)
-				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
-				require_Equal(t, sm.Subject, "foo")
-
-				// Since we have a subject delete marker now with a higher TTL, if this
-				// message's lower TTL would be respected then we would not have a new
-				// subject delete marker when this message expires.
-				pa, err := js.PublishMsg(m)
-				require_NoError(t, err)
-				require_Equal(t, pa.Sequence, 3)
-
-				// After some time the first subject delete marker should be gone, and the new one should be placed.
-				time.Sleep(3500 * time.Millisecond)
-
-				_, err = js.GetMsg("TEST", 2)
-				require_Error(t, err, nats.ErrMsgNotFound)
-
-				sm, err = js.GetMsg("TEST", 4)
-				require_NoError(t, err)
-				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
-				require_Equal(t, sm.Subject, "foo")
+				// When the second message age-expires, a FRESH marker must be
+				// placed (this was the silently-missed case).
+				checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+					if _, err := js.GetMsg("TEST", pa.Sequence); err == nil {
+						return fmt.Errorf("msg two still present")
+					}
+					sm, err := js.GetLastMsg("TEST", "foo")
+					if err != nil {
+						return fmt.Errorf("no fresh marker: %v", err)
+					}
+					if sm.Header.Get(JSMarkerReason) != JSMarkerReasonMaxAge {
+						return fmt.Errorf("last msg is not a marker")
+					}
+					if sm.Sequence <= pa.Sequence {
+						return fmt.Errorf("marker %d not fresh (msg was %d)", sm.Sequence, pa.Sequence)
+					}
+					return nil
+				})
 			})
 		}
 	}
@@ -6807,7 +6929,7 @@ func TestJetStreamClusterSDMInflightTTL(t *testing.T) {
 			_, err := jsStreamCreate(t, nc, &StreamConfig{
 				Name:                   "TEST",
 				Retention:              LimitsPolicy,
-				Subjects:               []string{"foo"},
+				Subjects:               []string{"foo", "bar"},
 				Storage:                storageType,
 				Replicas:               3,
 				SubjectDeleteMarkerTTL: 2 * time.Second,
@@ -6849,7 +6971,10 @@ func TestJetStreamClusterSDMInflightTTL(t *testing.T) {
 			rn.Unlock()
 
 			// Ensures we can check the stream leader's full log has been applied.
-			_, err = js.Publish("foo", nil)
+			// Published to a sibling subject: a publish to "foo" itself would
+			// (correctly) remove the just-placed subject delete marker under
+			// stale-marker replacement, which is not what this test verifies.
+			_, err = js.Publish("bar", nil)
 			require_NoError(t, err)
 
 			// Check all messages are removed.

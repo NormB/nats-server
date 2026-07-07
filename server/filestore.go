@@ -5088,6 +5088,27 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 		return err
 	}
 
+	// Subject delete marker bookkeeping: track a stored marker; storing a
+	// real message over a tracked (stale) marker removes the marker right
+	// away -- the MaxMsgsPer=1 displacement behavior generalized -- so a
+	// marker never coexists with live data and the count-based
+	// last-of-subject decision at expiry stays exact.  Local and
+	// deterministic: every replica does this at the same apply point.
+	if fs.cfg.SubjectDeleteMarkerTTL > 0 {
+		if len(hdr) > 0 && isSubjectDeleteMarker(hdr) {
+			if fs.sdm == nil {
+				fs.sdm = newSDMMeta()
+			}
+			fs.sdm.trackMarker(subj, seq)
+		} else if mseq, ok := fs.sdm.markerFor(subj); ok && mseq < seq {
+			// Removal funnels through removeSeqPerSubject, which drops
+			// the tracking entry; a failed removal means the marker is
+			// already gone, so drop the entry regardless.
+			fs.removeMsgViaLimits(mseq)
+			fs.sdm.removeSeqAndSubject(mseq, subj)
+		}
+	}
+
 	// Per-message TTL.
 	if ttl > 0 {
 		if fs.ttls != nil {

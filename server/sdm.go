@@ -22,6 +22,14 @@ import (
 type SDMMeta struct {
 	totals  map[string]uint64
 	pending map[uint64]SDMBySeq
+	// markers tracks, per subject, the sequence of the subject delete
+	// marker currently topping it.  Markers are placed via rollup, so a
+	// tracked subject holds no live data; storing a real message on it
+	// removes the stale marker (see the storeRawMsg hooks), which keeps
+	// the count-based last-of-subject decision exact at expiry time.
+	// Entries exit on marker removal (any path funnels through
+	// removeSeqAndSubject) or wholesale via empty() on purge/truncate.
+	markers map[string]uint64
 }
 
 // SDMBySeq holds data for a message with a specific sequence.
@@ -34,6 +42,7 @@ func newSDMMeta() *SDMMeta {
 	return &SDMMeta{
 		totals:  make(map[string]uint64, 1),
 		pending: make(map[uint64]SDMBySeq, 1),
+		markers: make(map[string]uint64, 1),
 	}
 }
 
@@ -50,6 +59,22 @@ func (sdm *SDMMeta) empty() {
 	}
 	clear(sdm.totals)
 	clear(sdm.pending)
+	clear(sdm.markers)
+}
+
+// trackMarker records that subj is currently topped by the subject delete
+// marker at seq.
+func (sdm *SDMMeta) trackMarker(subj string, seq uint64) {
+	sdm.markers[subj] = seq
+}
+
+// markerFor returns the tracked marker sequence for subj, if any.
+func (sdm *SDMMeta) markerFor(subj string) (uint64, bool) {
+	if sdm == nil {
+		return 0, false
+	}
+	seq, ok := sdm.markers[subj]
+	return seq, ok
 }
 
 // trackPending caches the given seq and subj and whether it's the last message for that subject.
@@ -66,6 +91,13 @@ func (sdm *SDMMeta) trackPending(seq uint64, subj string, last bool) bool {
 func (sdm *SDMMeta) removeSeqAndSubject(seq uint64, subj string) {
 	if sdm == nil {
 		return
+	}
+	// Every removal path funnels through here (removeSeqPerSubject), so
+	// this is also where a removed marker leaves the tracking map --
+	// whether it was replaced at store time, self-expired via its TTL,
+	// aged out, or removed by limits.
+	if mseq, ok := sdm.markers[subj]; ok && mseq == seq {
+		delete(sdm.markers, subj)
 	}
 	if _, ok := sdm.pending[seq]; ok {
 		delete(sdm.pending, seq)
