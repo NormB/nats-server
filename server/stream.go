@@ -110,6 +110,16 @@ type StreamConfig struct {
 	// subject delete markers.
 	SubjectDeleteMarkerTTL time.Duration `json:"subject_delete_marker_ttl,omitempty"`
 
+	// AllowMsgTTLBelowMarker allows per-message TTLs shorter than
+	// SubjectDeleteMarkerTTL on streams with MaxMsgsPer != 1.  By default
+	// such TTLs are raised to SubjectDeleteMarkerTTL at ingest so that a
+	// still-live delete marker on the subject cannot cause the fresh
+	// marker a shorter-lived message needs on expiry to be missed.  With
+	// this flag the ingest clamp is disabled and the expiry path instead
+	// detects subjects whose only remaining messages are markers and
+	// places a fresh (rollup) marker, purging the stale ones.
+	AllowMsgTTLBelowMarker bool `json:"allow_msg_ttl_below_marker,omitempty"`
+
 	// AllowMsgCounter allows a stream to use (only) counter CRDTs.
 	AllowMsgCounter bool `json:"allow_msg_counter,omitempty"`
 
@@ -1791,6 +1801,12 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 		}
 	} else if cfg.SubjectDeleteMarkerTTL < 0 {
 		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject delete marker TTL must not be negative"))
+	}
+
+	// The below-marker TTL opt-out only means something when the ingest
+	// clamp it disables is active, i.e. when subject delete markers are on.
+	if cfg.AllowMsgTTLBelowMarker && cfg.SubjectDeleteMarkerTTL <= 0 {
+		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("allowing message TTLs below the marker TTL requires a subject delete marker TTL"))
 	}
 
 	if cfg.AllowMsgSchedules {
@@ -6965,7 +6981,10 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	// If subject delete markers are used, ensure message TTL is that at minimum.
 	// Otherwise, subject delete markers could be missed if one already exists for this subject.
 	// MaxMsgsPer=1 is an exception, because we'll only ever have one message.
-	if ttl > 0 && mset.cfg.SubjectDeleteMarkerTTL > 0 && mset.cfg.MaxMsgsPer != 1 {
+	// AllowMsgTTLBelowMarker disables this clamp; the expiry path then detects
+	// subjects whose only remaining messages are markers and places a fresh
+	// (rollup) marker itself, purging the stale ones.
+	if ttl > 0 && mset.cfg.SubjectDeleteMarkerTTL > 0 && mset.cfg.MaxMsgsPer != 1 && !mset.cfg.AllowMsgTTLBelowMarker {
 		if minTtl := int64(mset.cfg.SubjectDeleteMarkerTTL.Seconds()); ttl < minTtl {
 			ttl = minTtl
 			hdr = removeHeaderIfPresent(hdr, JSMessageTTL)

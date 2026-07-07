@@ -6510,6 +6510,114 @@ func TestJetStreamClusterSubjectDeleteMarkersMinimumTTLExceptionMaxMsgsPer(t *te
 	}
 }
 
+func TestJetStreamClusterSubjectDeleteMarkersMsgTTLBelowMarker(t *testing.T) {
+	// AllowMsgTTLBelowMarker disables the ingest clamp that raises
+	// per-message TTLs to SubjectDeleteMarkerTTL on MaxMsgsPer != 1
+	// streams.  The expiry path must then keep marker placement correct
+	// on its own: a message expiring while a stale marker still sits on
+	// the subject must produce a fresh marker (which purges the stale
+	// one), and a message expiring while OLDER LIVE DATA remains must
+	// not produce any marker at all (the head rolls back).
+	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
+		for _, replicas := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/R%d", storageType, replicas), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+
+				// The flag is only meaningful with markers enabled.
+				_, err := jsStreamCreate(t, nc, &StreamConfig{
+					Name:                   "BAD",
+					Retention:              LimitsPolicy,
+					Subjects:               []string{"nope"},
+					Replicas:               replicas,
+					Storage:                storageType,
+					AllowMsgTTL:            true,
+					AllowMsgTTLBelowMarker: true,
+				})
+				require_Error(t, err)
+
+				_, err = jsStreamCreate(t, nc, &StreamConfig{
+					Name:                   "TEST",
+					Retention:              LimitsPolicy,
+					Subjects:               []string{"foo", "bar"},
+					Replicas:               replicas,
+					Storage:                storageType,
+					SubjectDeleteMarkerTTL: 3 * time.Second,
+					AllowMsgTTL:            true,
+					MaxMsgsPer:             5,
+					AllowMsgTTLBelowMarker: true,
+				})
+				require_NoError(t, err)
+
+				m := nats.NewMsg("foo")
+				m.Header.Set(JSMessageTTL, "1s")
+				_, err = js.PublishMsg(m)
+				require_NoError(t, err)
+
+				// The ingest clamp must NOT rewrite the header.
+				rsm, err := js.GetMsg("TEST", 1)
+				require_NoError(t, err)
+				require_Equal(t, rsm.Header.Get(JSMessageTTL), "1s")
+
+				// The message TTL must be respected despite MaxMsgsPer != 1.
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", 1)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				// Expect a subject delete marker based on per-message TTL.
+				sm, err := js.GetMsg("TEST", 2)
+				require_NoError(t, err)
+				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
+				require_Equal(t, sm.Subject, "foo")
+
+				// The scenario the ingest clamp used to guard against:
+				// publish another short-TTL message while the previous
+				// subject delete marker is still alive.
+				pa, err := js.PublishMsg(m)
+				require_NoError(t, err)
+				require_Equal(t, pa.Sequence, 3)
+
+				// It must expire on ITS OWN TTL (not the marker TTL), and
+				// a FRESH marker must be placed, purging the stale one.
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", 3)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				sm, err = js.GetMsg("TEST", 4)
+				require_NoError(t, err)
+				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
+				require_Equal(t, sm.Subject, "foo")
+
+				// The stale marker was purged by the fresh marker's rollup.
+				_, err = js.GetMsg("TEST", 2)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				// Rollback case: older live data remains on the subject, so
+				// the expiring message must NOT leave a marker behind; the
+				// head simply rolls back to the previous revision.
+				_, err = js.Publish("bar", []byte("live"))
+				require_NoError(t, err)
+				bm := nats.NewMsg("bar")
+				bm.Header.Set(JSMessageTTL, "1s")
+				pa, err = js.PublishMsg(bm)
+				require_NoError(t, err)
+
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", pa.Sequence)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				lm, err := js.GetLastMsg("TEST", "bar")
+				require_NoError(t, err)
+				require_Equal(t, lm.Header.Get(JSMarkerReason), _EMPTY_)
+				require_Equal(t, string(lm.Data), "live")
+			})
+		}
+	}
+}
+
 func TestJetStreamClusterSubjectDeleteMarkersNoMsgTTLSet(t *testing.T) {
 	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
 		for _, replicas := range []int{1, 3} {

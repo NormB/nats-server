@@ -1323,6 +1323,18 @@ func (ms *memStore) expireMsgs() {
 			ms.mu.Unlock()
 			if ok {
 				sdm := last && !isSubjectDeleteMarker(sm.hdr)
+				// With the ingest clamp disabled, a message can expire
+				// while stale markers still sit on its subject (they
+				// count towards the totals, so last=false).  If nothing
+				// BUT markers remains, this expiry empties the subject
+				// of real data and must still place a fresh marker; its
+				// rollup purges the stale ones.  Re-checked on every
+				// retry, so late-arriving live data downgrades it again.
+				if !sdm && !last && ms.cfg.AllowMsgTTLBelowMarker &&
+					!isSubjectDeleteMarker(sm.hdr) &&
+					ms.subjectOnlyMarkersRemain(sm.subj, rm.Seq) {
+					sdm = true
+				}
 				ms.handleRemovalOrSdm(rm.Seq, sm.subj, sdm, sdmTTL)
 			}
 		}
@@ -1380,6 +1392,37 @@ func (ms *memStore) shouldProcessSdmLocked(seq uint64, subj string) (bool, bool)
 	numPending := ms.sdm.totals[subj]
 	remaining := msgs - numPending
 	return ms.sdm.trackPending(seq, subj, remaining == 1), true
+}
+
+// subjectOnlyMarkersRemain reports whether every remaining message for
+// subj -- excluding skip and any sequence that already has a
+// removal/SDM proposal pending -- is a subject delete marker.  See the
+// fileStore counterpart for the rationale.  Lock must NOT be held.
+func (ms *memStore) subjectOnlyMarkersRemain(subj string, skip uint64) bool {
+	var smv StoreMsg
+
+	ms.mu.RLock()
+	pending := make(map[uint64]struct{}, 1)
+	if ms.sdm != nil {
+		for seq := range ms.sdm.pending {
+			pending[seq] = struct{}{}
+		}
+	}
+	start := ms.state.FirstSeq
+	ms.mu.RUnlock()
+
+	for seq := start; ; {
+		sm, _, err := ms.LoadNextMsg(subj, false, seq, &smv)
+		if err != nil || sm == nil {
+			return true
+		}
+		if sm.seq != skip {
+			if _, ok := pending[sm.seq]; !ok && !isSubjectDeleteMarker(sm.hdr) {
+				return false
+			}
+		}
+		seq = sm.seq + 1
+	}
 }
 
 func (ms *memStore) handleRemovalOrSdm(seq uint64, subj string, sdm bool, sdmTTL int64) {
