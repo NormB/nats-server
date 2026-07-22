@@ -58,7 +58,7 @@ func setStaticStreamMetadata(cfg *StreamConfig) {
 	}
 
 	// TTLs were added in v2.11 and require API level 1.
-	if cfg.AllowMsgTTL || cfg.SubjectDeleteMarkerTTL > 0 {
+	if cfg.AllowMsgTTL || cfg.SubjectDeleteMarkerTTL > 0 || cfg.AllowMsgTTLBelowMarker {
 		requires(1)
 	}
 

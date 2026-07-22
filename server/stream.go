@@ -110,6 +110,16 @@ type StreamConfig struct {
 	// subject delete markers.
 	SubjectDeleteMarkerTTL time.Duration `json:"subject_delete_marker_ttl,omitempty"`
 
+	// AllowMsgTTLBelowMarker allows per-message TTLs shorter than
+	// SubjectDeleteMarkerTTL on streams with MaxMsgsPer != 1.  By default
+	// such TTLs are raised to SubjectDeleteMarkerTTL at ingest so that a
+	// still-live delete marker on the subject cannot cause the fresh
+	// marker a shorter-lived message needs on expiry to be missed.  With
+	// this flag the ingest clamp is disabled and the expiry path instead
+	// detects subjects whose only remaining messages are markers and
+	// places a fresh (rollup) marker, purging the stale ones.
+	AllowMsgTTLBelowMarker bool `json:"allow_msg_ttl_below_marker,omitempty"`
+
 	// AllowMsgCounter allows a stream to use (only) counter CRDTs.
 	AllowMsgCounter bool `json:"allow_msg_counter,omitempty"`
 
@@ -1791,6 +1801,12 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 		}
 	} else if cfg.SubjectDeleteMarkerTTL < 0 {
 		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject delete marker TTL must not be negative"))
+	}
+
+	// The below-marker TTL opt-out only means something when the ingest
+	// clamp it disables is active, i.e. when subject delete markers are on.
+	if cfg.AllowMsgTTLBelowMarker && cfg.SubjectDeleteMarkerTTL <= 0 {
+		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("allowing message TTLs below the marker TTL requires a subject delete marker TTL"))
 	}
 
 	if cfg.AllowMsgSchedules {
@@ -6969,7 +6985,10 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	// displacement behavior, generalized -- see the subject delete marker
 	// bookkeeping in storeRawMsg), which keeps the count-based
 	// last-of-subject decision at expiry exact and guarantees a fresh
-	// marker for every subject-emptying deletion.
+	// marker for every subject-emptying deletion.  The
+	// AllowMsgTTLBelowMarker stream option remains accepted (clients use
+	// it to probe for below-marker TTL support) but is a no-op here:
+	// marker replacement provides the behavior unconditionally.
 
 	// Store actual msg.
 	if lseq == 0 && ts == 0 {
